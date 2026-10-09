@@ -33,6 +33,7 @@ public class CalendarEvent {
     private final String calAccountType;
     private final String calendarId;
     private final String organizer;
+    private final String timezone;
     private final int calendarColor;
     private final int color;
     private final boolean allDay;
@@ -45,6 +46,15 @@ public class CalendarEvent {
                          String location, String calName, String calAccountName, int calendarColor,
                          int color, boolean allDay, String organizer, String calAccountType,
                          String calendarId, String rrule, int status, int attendingStatus) {
+        this(begin, end, id, eventId, title, description, location, calName, calAccountName,
+                calendarColor, color, allDay, organizer, calAccountType, calendarId, rrule,
+                status, attendingStatus, null);
+    }
+
+    public CalendarEvent(long begin, long end, long id, long eventId, String title, String description,
+                         String location, String calName, String calAccountName, int calendarColor,
+                         int color, boolean allDay, String organizer, String calAccountType,
+                         String calendarId, String rrule, int status, int attendingStatus, String timezone) {
         this.begin = begin;
         this.end = end;
         this.id = id;
@@ -58,6 +68,7 @@ public class CalendarEvent {
         this.color = color;
         this.allDay = allDay;
         this.organizer = organizer;
+        this.timezone = timezone;
         this.calAccountType = calAccountType;
         this.calendarId = calendarId;
         this.rrule = rrule;
@@ -113,6 +124,8 @@ public class CalendarEvent {
     public String getOrganizer() {
         return organizer;
     }
+
+    public String getTimezone() { return timezone; }
 
     public String getDescription() {
         return description;
@@ -180,6 +193,7 @@ public class CalendarEvent {
                     (this.getColor() == e.getColor()) &&
                     (this.isAllDay() == e.isAllDay()) &&
                     Objects.equals(this.getOrganizer(), e.getOrganizer()) &&
+                    Objects.equals(this.getTimezone(), e.getTimezone()) &&
                     Objects.equals(this.getRemindersAbsoluteTs(), e.getRemindersAbsoluteTs()) &&
                     Objects.equals(this.getCalAccountType(), e.getCalAccountType()) &&
                     Objects.equals(this.getCalendarId(), e.getCalendarId()) &&
@@ -206,6 +220,7 @@ public class CalendarEvent {
         result = 31 * result + Integer.valueOf(color).hashCode();
         result = 31 * result + Boolean.valueOf(allDay).hashCode();
         result = 31 * result + Objects.hash(organizer);
+        result = 31 * result + Objects.hash(timezone);
         result = 31 * result + Objects.hash(remindersAbsoluteTs);
         result = 31 * result + Objects.hash(calAccountType);
         result = 31 * result + Objects.hash(calendarId);

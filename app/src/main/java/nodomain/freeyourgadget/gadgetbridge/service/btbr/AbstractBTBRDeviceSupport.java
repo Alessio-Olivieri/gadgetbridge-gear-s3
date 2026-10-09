@@ -120,7 +120,10 @@ public abstract class AbstractBTBRDeviceSupport extends AbstractBluetoothDeviceS
         synchronized (ConnectionMonitor) {
             closeAllAuxChannels();
             if (mQueue != null) {
-                mQueue.disconnect();
+                // BtBRQueue.disconnect() stops its write HandlerThread. Reusing that queue on
+                // automatic reconnect would post to a dead Handler, so discard it here.
+                mQueue.dispose();
+                mQueue = null;
             }
         }
     }

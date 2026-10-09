@@ -20,6 +20,9 @@ package nodomain.freeyourgadget.gadgetbridge.deviceevents;
 import static nodomain.freeyourgadget.gadgetbridge.util.GB.NOTIFICATION_CHANNEL_HIGH_PRIORITY_ID;
 
 import android.app.PendingIntent;
+import android.app.NotificationManager;
+import android.Manifest;
+import android.content.pm.PackageManager;
 import android.companion.CompanionDeviceManager;
 import android.content.Context;
 import android.content.Intent;
@@ -29,6 +32,8 @@ import android.os.Build;
 import androidx.annotation.NonNull;
 import androidx.annotation.RequiresApi;
 import androidx.core.app.NotificationCompat;
+import androidx.core.app.NotificationManagerCompat;
+import androidx.core.content.ContextCompat;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import org.slf4j.Logger;
@@ -39,14 +44,17 @@ import nodomain.freeyourgadget.gadgetbridge.R;
 import nodomain.freeyourgadget.gadgetbridge.activities.FindPhoneActivity;
 import nodomain.freeyourgadget.gadgetbridge.impl.GBDevice;
 import nodomain.freeyourgadget.gadgetbridge.util.GB;
+import nodomain.freeyourgadget.gadgetbridge.util.FindPhoneSession;
 
 public class GBDeviceEventFindPhone extends GBDeviceEvent {
     private static final Logger LOG = LoggerFactory.getLogger(GBDeviceEventFindPhone.class);
 
     public Event event = Event.UNKNOWN;
+    public String sessionToken;
 
     @Override
     public void evaluate(final Context context, final GBDevice device) {
+        if (sessionToken != null && !FindPhoneSession.INSTANCE.current(sessionToken)) return;
         LOG.info("Got GBDeviceEventFindPhone: {}", this.event);
         switch (this.event) {
             case START:
@@ -86,7 +94,10 @@ public class GBDeviceEventFindPhone extends GBDeviceEvent {
             final Intent startIntent = new Intent(context, FindPhoneActivity.class);
             startIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             startIntent.putExtra(FindPhoneActivity.EXTRA_RING, ring);
+            addSession(startIntent);
+            LOG.info("Find Phone Activity launch attempt: owned={} route=direct", sessionToken != null);
             context.startActivity(startIntent);
+            LOG.info("Find Phone Activity launch scheduled: owned={}", sessionToken != null);
         } else {
             handleGBDeviceEventFindPhoneStartNotification(context, ring);
         }
@@ -96,7 +107,11 @@ public class GBDeviceEventFindPhone extends GBDeviceEvent {
     private void handleGBDeviceEventFindPhoneStartNotification(final Context context, final boolean ring) {
         LOG.info("Got handleGBDeviceEventFindPhoneStartNotification");
         final CompanionDeviceManager manager = (CompanionDeviceManager) context.getSystemService(Context.COMPANION_DEVICE_SERVICE);
-        if (manager.getAssociations().isEmpty()) {
+        final boolean associated = manager != null && !manager.getAssociations().isEmpty();
+        final boolean owned = sessionToken != null;
+        LOG.info("Find Phone launch prerequisites: owned={} companionAssociation={} notificationsEnabled={}",
+                owned, associated, NotificationManagerCompat.from(context).areNotificationsEnabled());
+        if (!owned && !associated) {
             // On Android Q and above, we need the device to be paired as companion. If it is not, display a notification
             // notifying the user and linking to further instructions
             final Intent instructionsIntent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://gadgetbridge.org/basics/pairing/companion-device/"));
@@ -125,6 +140,7 @@ public class GBDeviceEventFindPhone extends GBDeviceEvent {
         intent.putExtra(FindPhoneActivity.EXTRA_RING, ring);
         intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
 
+        addSession(intent);
         final PendingIntent pi = PendingIntent.getActivity(
                 context,
                 0,
@@ -135,15 +151,56 @@ public class GBDeviceEventFindPhone extends GBDeviceEvent {
         final NotificationCompat.Builder notification = new NotificationCompat.Builder(context, NOTIFICATION_CHANNEL_HIGH_PRIORITY_ID)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setOngoing(false)
-                .setFullScreenIntent(pi, true)
+                .setContentIntent(pi)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setAutoCancel(true)
                 .setGroup("BackgroundService")
                 .setContentTitle(context.getString(R.string.find_my_phone_notification));
 
-        GB.notify(GB.NOTIFICATION_ID_PHONE_FIND, notification.build(), context);
+        final boolean fullScreen = !owned || canUseFullScreenIntent(context);
+        if (fullScreen) notification.setFullScreenIntent(pi, true);
+        // Gear uses an existing Classic bond without CDM association. Let Android decide whether
+        // the launch is allowed (for example, while GB is visible), rather than rejecting it here.
+        LOG.info("Find Phone notification creation: owned={} fullScreen={}", owned, fullScreen);
+        try {
+            GB.notify(GB.NOTIFICATION_ID_PHONE_FIND, notification.build(), context);
+        } catch (final RuntimeException e) {
+            if (!owned) throw e;
+            LOG.warn("Find Phone notification creation failed; trying direct Activity launch", e);
+        }
+        if (owned && !FindPhoneSession.INSTANCE.current(sessionToken)) return;
+        LOG.info("Find Phone Activity launch attempt: owned={} companionAssociation={}", owned, associated);
         context.startActivity(intent);
-        LOG.debug("CompanionDeviceManager associations were found, starting intent");
+        // startActivity has no synchronous playback result; Android can silently block a BAL.
+        LOG.info("Find Phone Activity launch scheduled: owned={}; awaiting lifecycle callback", owned);
+    }
+
+    private static boolean canUseFullScreenIntent(final Context context) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.USE_FULL_SCREEN_INTENT)
+                != PackageManager.PERMISSION_GRANTED) return false;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return true;
+        final NotificationManager manager = context.getSystemService(NotificationManager.class);
+        return manager != null && manager.canUseFullScreenIntent();
+    }
+
+    private void addSession(final Intent intent) {
+        if (sessionToken == null) return;
+        intent.putExtra(FindPhoneSession.EXTRA_TOKEN, sessionToken);
+        // Distinct PendingIntent identity: cancellation cannot target a later operation.
+        intent.setData(Uri.parse("gadgetbridge://find-phone/" + sessionToken));
+    }
+
+    public static void cancelSessionNotification(final Context context, final String token) {
+        final Intent intent = new Intent(context, FindPhoneActivity.class)
+                .setPackage(BuildConfig.APPLICATION_ID)
+                .setData(Uri.parse("gadgetbridge://find-phone/" + token));
+        final PendingIntent pi = PendingIntent.getActivity(context, 0, intent,
+                PendingIntent.FLAG_NO_CREATE | PendingIntent.FLAG_IMMUTABLE);
+        if (pi != null) pi.cancel();
+        // Only remove a notification while no newer owned operation is using it.
+        if (FindPhoneSession.INSTANCE.idle()) {
+            GB.removeNotification(GB.NOTIFICATION_ID_PHONE_FIND, context);
+        }
     }
 
     public enum Event {

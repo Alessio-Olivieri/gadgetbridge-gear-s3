@@ -234,8 +234,8 @@ class NotificationsDebugFragment : AbstractDebugFragment() {
             when (Objects.requireNonNull(intent.action)) {
                 ACTION_REPLY -> {
                     val remoteInput = RemoteInput.getResultsFromIntent(intent)
-                    val reply = remoteInput!!.getCharSequence(EXTRA_REPLY)
-                    LOG.info("Got wearable reply: $reply")
+                    val reply = remoteInput?.getCharSequence(EXTRA_REPLY)
+                    LOG.debug("Received test notification reply (length={})", reply?.length ?: 0)
                     GB.toast(context, "Reply: $reply", Toast.LENGTH_SHORT, GB.INFO)
                 }
 

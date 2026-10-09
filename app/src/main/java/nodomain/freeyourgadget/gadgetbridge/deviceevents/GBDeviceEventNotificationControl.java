@@ -19,6 +19,7 @@ package nodomain.freeyourgadget.gadgetbridge.deviceevents;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.os.ResultReceiver;
 import android.telephony.SmsManager;
 
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
@@ -39,6 +40,8 @@ public class GBDeviceEventNotificationControl extends GBDeviceEvent {
     public String phoneNumber;
     public String reply;
     public String title;
+    /** Local-only completion for a device protocol that requires PendingIntent dispatch status. */
+    public ResultReceiver replyResultReceiver;
     public Event event = Event.UNKNOWN;
 
     @Override
@@ -67,7 +70,8 @@ public class GBDeviceEventNotificationControl extends GBDeviceEvent {
                     SmsManager.getDefault().sendTextMessage(phoneNumber, null, reply, null, null);
                     return;
                 } else {
-                    LOG.info("Got notification reply for notification id {} : {}", handle, reply);
+                    LOG.debug("Got notification reply for notification id {} (length={})", handle,
+                            reply == null ? 0 : reply.length());
                     action = NotificationListener.ACTION_REPLY;
                 }
                 break;
@@ -88,6 +92,7 @@ public class GBDeviceEventNotificationControl extends GBDeviceEvent {
             }
             notificationListenerIntent.putExtra("reply", reply);
         }
+        if (replyResultReceiver != null) notificationListenerIntent.putExtra(NotificationListener.EXTRA_REPLY_RESULT_RECEIVER, replyResultReceiver);
         LocalBroadcastManager.getInstance(context).sendBroadcast(notificationListenerIntent);
     }
 

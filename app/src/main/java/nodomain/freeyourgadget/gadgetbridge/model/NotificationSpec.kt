@@ -18,6 +18,7 @@
 package nodomain.freeyourgadget.gadgetbridge.model
 
 import android.os.Parcelable
+import android.graphics.drawable.Icon
 import kotlinx.parcelize.Parcelize
 import nodomain.freeyourgadget.gadgetbridge.service.DeviceSupport
 import nodomain.freeyourgadget.gadgetbridge.util.RtlUtils
@@ -46,6 +47,18 @@ data class NotificationSpec @JvmOverloads constructor(
     var iconId: Int = 0,
     var iconPackageId: String? = null,
     var picturePath: String? = null,
+    /** NotificationService large/person icon, kept separate from picturePath. */
+    var avatarIcon: Icon? = null,
+    /** Samsung protocol-v15 MessagingStyle JSON; generated from Android's exposed MessagingStyle only. */
+    var messagingStyleJson: String? = null,
+    /** Local delta metadata only; never serialized into Samsung attr 44. */
+    var samsungMessagingSnapshot: String? = null,
+    /**
+     * Gear S3 BigPicture compatibility candidate.  This is URI metadata only:
+     * image I/O and rasterization are deferred to GearS3DeviceSupport's ordered worker.
+     */
+    var samsungBigPictureMediaUri: String? = null,
+    var samsungBigPictureMediaMimeType: String? = null,
     var dndSuppressed: Int = 0,
     val id: Int = if (requestedId != -1) requestedId else c.incrementAndGet(),
 ) : DeviceTextAdaptable<NotificationSpec>, Parcelable {
@@ -95,7 +108,11 @@ data class NotificationSpec @JvmOverloads constructor(
     data class Action @JvmOverloads constructor(
         var type: Int = TYPE_UNDEFINED,
         var handle: Long = 0,
-        var title: String? = null
+        var title: String? = null,
+        var remoteInputKey: String? = null,
+        var remoteInputLabel: String? = null,
+        var remoteInputAllowFreeInput: Boolean = false,
+        var remoteInputChoices: Array<String>? = null
     ) : Parcelable {
         val isReply: Boolean
             get() = type == TYPE_WEARABLE_REPLY || type == TYPE_SYNTHETIC_REPLY_PHONENR || type == TYPE_CUSTOM_REPLY

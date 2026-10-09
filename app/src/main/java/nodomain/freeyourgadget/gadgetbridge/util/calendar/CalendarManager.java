@@ -51,6 +51,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.StringJoiner;
+import java.util.TimeZone;
 
 import nodomain.freeyourgadget.gadgetbridge.GBApplication;
 import nodomain.freeyourgadget.gadgetbridge.R;
@@ -125,16 +126,83 @@ public class CalendarManager {
     }
 
     private List<CalendarEvent> getCalendarEvents(final int lookaheadDays) {
-        final List<CalendarEvent> calendarEventList = new ArrayList<>();
-
         Calendar cal = GregorianCalendar.getInstance();
         long dtStart = cal.getTimeInMillis();
         cal.add(Calendar.DATE, lookaheadDays);
         long dtEnd = cal.getTimeInMillis();
+        return getCalendarEventsInRange(dtStart, dtEnd, false);
+    }
+
+    /** Calendar-only source for devices whose peer requests exact time windows. */
+    public List<CalendarEvent> getCalendarEventList(final long startMillis, final long endMillis) {
+        if (startMillis < 0 || endMillis <= startMillis) throw new IllegalArgumentException("Invalid calendar range");
+        loadCalendarsBlackList();
+        loadColorBlackList();
+        final Prefs prefs = new Prefs(GBApplication.getDeviceSpecificSharedPrefs(deviceAddress));
+        final boolean syncEnabled = prefs.getBoolean(DeviceSettingsPreferenceConst.PREF_SYNC_CALENDAR, false);
+        final boolean permissionGranted = mContext.checkSelfPermission(Manifest.permission.READ_CALENDAR)
+                == PackageManager.PERMISSION_GRANTED;
+        LOG.info("Calendar exact-range source: syncEnabled={} readCalendarGranted={} blacklistedCalendars={} colorBlacklists={}",
+                syncEnabled, permissionGranted, calendarBlacklist.size(), colorBlacklist.size());
+        if (!syncEnabled || !permissionGranted) {
+            return new ArrayList<>();
+        }
+        logSelectedCalendarIds();
+        return getCalendarEventsInRange(startMillis, endMillis, true);
+    }
+
+    private void logSelectedCalendarIds() {
+        final String[] projection = {CalendarContract.Calendars._ID,
+                CalendarContract.Calendars.ACCOUNT_NAME, CalendarContract.Calendars.CALENDAR_DISPLAY_NAME,
+                CalendarContract.Calendars.VISIBLE};
+        final List<Long> selected = new ArrayList<>();
+        int available = 0;
+        int visible = 0;
+        try (Cursor cursor = mContext.getContentResolver().query(CalendarContract.Calendars.CONTENT_URI,
+                projection, null, null, null)) {
+            if (cursor == null) {
+                LOG.warn("Calendar selection diagnostics: Calendars query returned no cursor");
+                return;
+            }
+            while (cursor.moveToNext()) {
+                available++;
+                if (cursor.getInt(3) != 0) visible++;
+                if (!isCalendarBlacklisted(cursor.getString(1) + '/' + cursor.getString(2))) {
+                    selected.add(cursor.getLong(0));
+                }
+            }
+            LOG.info("Calendar selection diagnostics: available={} visible={} selectedCount={} selectedIds={}",
+                    available, visible, selected.size(), selected);
+        } catch (final RuntimeException e) {
+            LOG.warn("Calendar selection diagnostics unavailable; proceeding with Instances query", e);
+        }
+    }
+
+    static boolean isInstanceInExactRange(final long begin, final long end, final boolean allDay,
+                                          final long requestedStart, final long requestedEnd, final TimeZone phoneZone) {
+        if (end <= begin || requestedEnd <= requestedStart) return false;
+        final long start = allDay ? requestedStart + phoneZone.getOffset(requestedStart) : requestedStart;
+        final long finish = allDay ? requestedEnd + phoneZone.getOffset(requestedEnd) : requestedEnd;
+        return end > start && begin < finish;
+    }
+
+    private List<CalendarEvent> getCalendarEventsInRange(final long dtStart, final long dtEnd, final boolean exactRange) {
+        final List<CalendarEvent> calendarEventList = new ArrayList<>();
+
+        // Android stores all-day instance boundaries at UTC midnight. Samsung queries
+        // them using the phone-zone-adjusted watch window. Include both windows in
+        // one Instances query, then filter each row using its own all-day flag.
+        final TimeZone phoneZone = TimeZone.getDefault();
+        final long allDayStart = dtStart + phoneZone.getOffset(dtStart);
+        final long allDayEnd = dtEnd + phoneZone.getOffset(dtEnd);
+        final long queryStart = exactRange ? Math.min(dtStart, allDayStart) : dtStart;
+        final long queryEnd = exactRange ? Math.max(dtEnd, allDayEnd) : dtEnd;
+        if (exactRange) LOG.info("Calendar Instances query: requestedStart={} requestedEnd={} queryStart={} queryEnd={} zone={}",
+                dtStart, dtEnd, queryStart, queryEnd, phoneZone.getID());
 
         Uri.Builder eventsUriBuilder = Instances.CONTENT_URI.buildUpon();
-        ContentUris.appendId(eventsUriBuilder, dtStart);
-        ContentUris.appendId(eventsUriBuilder, dtEnd);
+        ContentUris.appendId(eventsUriBuilder, queryStart);
+        ContentUris.appendId(eventsUriBuilder, queryEnd);
         Uri eventsUri = eventsUriBuilder.build();
 
         final String[] EVENT_INSTANCE_PROJECTION = new String[]{
@@ -157,13 +225,16 @@ public class CalendarManager {
                 Instances.RRULE,
                 Instances.STATUS,
                 Instances.SELF_ATTENDEE_STATUS,
-                Instances.HAS_EXTENDED_PROPERTIES
+                Instances.HAS_EXTENDED_PROPERTIES,
+                Instances.EVENT_TIMEZONE
         };
 
         final Prefs prefs = new Prefs(GBApplication.getDeviceSpecificSharedPrefs(deviceAddress));
         boolean filterCanceled = !prefs.getBoolean(DeviceSettingsPreferenceConst.PREF_CALENDAR_SYNC_CANCELED, true);
         boolean filterDeclined = !prefs.getBoolean(DeviceSettingsPreferenceConst.PREF_CALENDAR_SYNC_DECLINED, true);
         boolean filterAllDay = !prefs.getBoolean(DeviceSettingsPreferenceConst.PREF_CALENDAR_SYNC_ALL_DAY, true);
+        if (exactRange) LOG.info("Calendar Instances SQL filters: excludeCanceled={} excludeDeclined={} excludeAllDay={}",
+                filterCanceled, filterDeclined, filterAllDay);
 
         ArrayList<String> selectionArgsList = new ArrayList<>();
         StringJoiner selection = new StringJoiner(" AND ");
@@ -185,10 +256,27 @@ public class CalendarManager {
         String[] selectionArgs = new String[selectionArgsList.size()];
         selectionArgsList.toArray(selectionArgs);
 
+        if (exactRange) {
+            try (Cursor rawCursor = mContext.getContentResolver().query(eventsUri,
+                    new String[]{Instances.EVENT_ID}, null, null, null)) {
+                LOG.info("Calendar Instances unfiltered rows={}", rawCursor == null ? -1 : rawCursor.getCount());
+            } catch (final RuntimeException e) {
+                LOG.warn("Calendar Instances unfiltered count unavailable", e);
+            }
+        }
+
         try (Cursor evtCursor = mContext.getContentResolver().query(eventsUri, EVENT_INSTANCE_PROJECTION, selection.toString(), selectionArgs, Instances.BEGIN + " ASC")) {
-            if (evtCursor == null || evtCursor.getCount() == 0) {
+            if (evtCursor == null) {
+                if (exactRange) throw new IllegalStateException("Calendar Instances query returned no cursor");
                 return calendarEventList;
             }
+            if (exactRange) LOG.info("Calendar Instances query succeeded: rows={}", evtCursor.getCount());
+            if (evtCursor.getCount() == 0) {
+                if (exactRange) LOG.info("Calendar Instances filtering: rows=0 outsideRange=0 excludedBySettings=0 retained=0");
+                return calendarEventList;
+            }
+            int outsideRange = 0;
+            int excludedBySettings = 0;
             while (evtCursor.moveToNext()) {
                 long start = evtCursor.getLong(evtCursor.getColumnIndexOrThrow(Instances.BEGIN));
                 long end = evtCursor.getLong(evtCursor.getColumnIndexOrThrow(Instances.END));
@@ -197,6 +285,11 @@ public class CalendarManager {
                     Time time = new Time(); //FIXME: deprecated FTW
                     time.parse(evtCursor.getString(evtCursor.getColumnIndexOrThrow(Instances.DURATION)));
                     end = start + time.toMillis(false);
+                }
+                final boolean allDay = evtCursor.getInt(evtCursor.getColumnIndexOrThrow(Instances.ALL_DAY)) != 0;
+                if (exactRange && !isInstanceInExactRange(start, end, allDay, dtStart, dtEnd, phoneZone)) {
+                    outsideRange++;
+                    continue;
                 }
 
                 CalendarEvent calEvent = new CalendarEvent(
@@ -211,13 +304,14 @@ public class CalendarManager {
                         evtCursor.getString(evtCursor.getColumnIndexOrThrow(CalendarContract.Calendars.ACCOUNT_NAME)),
                         evtCursor.getInt(evtCursor.getColumnIndexOrThrow(Instances.CALENDAR_COLOR)),
                         evtCursor.getInt(evtCursor.getColumnIndexOrThrow(Instances.EVENT_COLOR)),
-                        !evtCursor.getString(evtCursor.getColumnIndexOrThrow(Instances.ALL_DAY)).equals("0"),
+                        allDay,
                         evtCursor.getString(evtCursor.getColumnIndexOrThrow(Instances.ORGANIZER)),
                         evtCursor.getString(evtCursor.getColumnIndexOrThrow(CalendarContract.Calendars.ACCOUNT_TYPE)),
                         evtCursor.getString(evtCursor.getColumnIndexOrThrow(Instances.CALENDAR_ID)),
                         evtCursor.getString(evtCursor.getColumnIndexOrThrow(Instances.RRULE)),
                         evtCursor.getInt(evtCursor.getColumnIndexOrThrow(Instances.STATUS)),
-                        evtCursor.getInt(evtCursor.getColumnIndexOrThrow(Instances.SELF_ATTENDEE_STATUS))
+                        evtCursor.getInt(evtCursor.getColumnIndexOrThrow(Instances.SELF_ATTENDEE_STATUS)),
+                        evtCursor.getString(evtCursor.getColumnIndexOrThrow(Instances.EVENT_TIMEZONE))
                 );
 
 
@@ -226,7 +320,8 @@ public class CalendarManager {
                 if (isCalendarBlacklisted(calEvent.getUniqueCalName()) ||
                     isColorBlacklistedForCalendar(calEvent.getUniqueCalName(), calEvent.getColor()) ||
                     (hasExtendedProperties && isExtendedPropertyBlacklisted(calEvent.getEventId()))) {
-                    LOG.debug("event {} - {} skipped because it's blacklisted or filtered", calEvent.getUniqueCalName(), calEvent.getTitle());
+                    if (exactRange) excludedBySettings++;
+                    LOG.debug("Calendar event filtered: eventId={} instanceStart={}", calEvent.getEventId(), calEvent.getBegin());
                     continue;
                 }
 
@@ -258,9 +353,19 @@ public class CalendarManager {
                 }
 
                 calendarEventList.add(calEvent);
+                if (exactRange) LOG.info("Calendar instance retained: calendarId={} eventId={} start={} end={} allDay={} timezone={}",
+                        calEvent.getCalendarId(), calEvent.getEventId(), calEvent.getBegin(), calEvent.getEnd(),
+                        calEvent.isAllDay(), calEvent.getTimezone());
             }
+            if (exactRange) LOG.info("Calendar Instances filtering: rows={} outsideRange={} excludedBySettings={} retained={}",
+                    evtCursor.getCount(), outsideRange, excludedBySettings, calendarEventList.size());
             return calendarEventList;
         } catch (final Exception e) {
+            if (exactRange) {
+                LOG.warn("Calendar Instances query failed: requestedStart={} requestedEnd={} queryStart={} queryEnd={}",
+                        dtStart, dtEnd, queryStart, queryEnd, e);
+                throw new IllegalStateException("Could not query requested calendar range", e);
+            }
             LOG.error("could not query calendar, permission denied?", e);
             return calendarEventList;
         }

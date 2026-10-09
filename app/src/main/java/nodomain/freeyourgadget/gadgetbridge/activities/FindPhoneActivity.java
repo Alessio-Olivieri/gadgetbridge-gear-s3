@@ -42,6 +42,7 @@ import org.slf4j.LoggerFactory;
 import nodomain.freeyourgadget.gadgetbridge.GBApplication;
 import nodomain.freeyourgadget.gadgetbridge.R;
 import nodomain.freeyourgadget.gadgetbridge.util.GB;
+import nodomain.freeyourgadget.gadgetbridge.util.FindPhoneSession;
 import nodomain.freeyourgadget.gadgetbridge.util.GBPrefs;
 
 
@@ -57,6 +58,8 @@ public class FindPhoneActivity extends AbstractGBActivity {
     private final BroadcastReceiver mReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
+            // Tokenless broadcasts belong to legacy callers and must not stop an owned alert.
+            if (sessionToken != null) return;
             String action = intent.getAction();
             if (action != null) {
                 LOG.info("Got action: {}", action);
@@ -79,10 +82,16 @@ public class FindPhoneActivity extends AbstractGBActivity {
     Vibrator mVibrator;
     AudioManager mAudioManager;
     int userVolume;
+    private boolean volumeSaved;
+    private String sessionToken;
+    private boolean legacyOwned;
+    private boolean playbackFailed;
     MediaPlayer mp;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        LOG.info("Find Phone Activity onCreate: owned={}",
+                getIntent().hasExtra(FindPhoneSession.EXTRA_TOKEN));
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_find_phone);
 
@@ -105,6 +114,12 @@ public class FindPhoneActivity extends AbstractGBActivity {
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        LOG.info("Find Phone Activity onStart: owned={} finishing={}", sessionToken != null, isFinishing());
+    }
+
+    @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
@@ -112,20 +127,59 @@ public class FindPhoneActivity extends AbstractGBActivity {
     }
 
     private void handleIntent(Intent intent) {
-        final boolean ring = intent.getBooleanExtra(EXTRA_RING, true);
-
-        GB.removeNotification(GB.NOTIFICATION_ID_PHONE_FIND, this);
-
-        vibrate();
-        if (ring) {
-            playRingtone();
+        final String requested = intent.getStringExtra(FindPhoneSession.EXTRA_TOKEN);
+        if (requested != null) {
+            if (!FindPhoneSession.INSTANCE.current(requested)) {
+                LOG.info("Find Phone Activity discarded canceled/stale launch");
+                if (sessionToken == null && !legacyOwned) finish();
+                return;
+            }
+            if (requested.equals(sessionToken)) return;
+            if (legacyOwned) return;
+            if (sessionToken != null) {
+                // The previous operation was canceled while Android was delivering this new intent.
+                stopVibration();
+                stopSound();
+            }
+            sessionToken = requested;
+            playbackFailed = false;
+            final boolean accepted = FindPhoneSession.INSTANCE.attachAndRun(requested,
+                    () -> runOnUiThread(() -> {
+                        if (!requested.equals(sessionToken)) return;
+                        stopVibration();
+                        stopSound();
+                        finish();
+                    }), () -> {
+                        GB.removeNotification(GB.NOTIFICATION_ID_PHONE_FIND, this);
+                        try {
+                            vibrate();
+                            if (!playRingtone()) throw new IllegalStateException("No Find Phone playback");
+                            LOG.info("Find Phone owned playback started");
+                        } catch (final RuntimeException e) {
+                            LOG.warn("Find Phone owned playback failed", e);
+                            playbackFailed = true;
+                            stopVibration();
+                            stopSound();
+                            FindPhoneSession.INSTANCE.finish(requested, true);
+                            finish();
+                        }
+                    });
+            if (!accepted) finish();
+            return;
         }
+        if (sessionToken != null || !FindPhoneSession.INSTANCE.enterLegacy()) return;
+        legacyOwned = true;
+        final boolean ring = intent.getBooleanExtra(EXTRA_RING, true);
+        GB.removeNotification(GB.NOTIFICATION_ID_PHONE_FIND, this);
+        vibrate();
+        if (ring) playRingtone();
         GBApplication.deviceService().onFindPhone(true);
     }
 
     private void vibrate() {
         mVibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
 
+        if (mVibrator == null) return;
         long[] vibrationPattern = new long[]{1000, 1000};
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -137,30 +191,45 @@ public class FindPhoneActivity extends AbstractGBActivity {
         }
     }
 
-    private void playRingtone() {
+    private boolean playRingtone() {
+        if (mp != null && mp.isPlaying()) return true;
         mAudioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-        if (mAudioManager != null) {
-            userVolume = mAudioManager.getStreamVolume(AudioManager.STREAM_ALARM);
-        }
-        if (mp != null && mp.isPlaying()) {
-            LOG.warn("Already playing");
-            return;
-        } else if (mp == null) {
+        if (mp == null) {
+            LOG.info("Find Phone MediaPlayer initialization: owned={}", sessionToken != null);
             mp = new MediaPlayer();
+            final String playbackToken = sessionToken;
+            if (playbackToken != null) mp.setOnErrorListener((player, what, extra) -> {
+                if (player != mp || !playbackToken.equals(sessionToken)
+                        || !FindPhoneSession.INSTANCE.current(playbackToken)) return true;
+                LOG.warn("Find Phone MediaPlayer error: what={} extra={}", what, extra);
+                playbackFailed = true;
+                finish();
+                return true;
+            });
         }
-
         if (!playConfiguredRingtone()) {
-            playFallbackRingtone();
+            LOG.info("Find Phone ringtone fallback: resetting player after configured source failure");
+            mp.reset();
+            if (!playFallbackRingtone()) return false;
         }
-
-        if (mAudioManager != null) {
+        // Owned requests respect alarm volume and DND; no persistent system settings to restore.
+        if (sessionToken == null && mAudioManager != null && !volumeSaved) {
             userVolume = mAudioManager.getStreamVolume(AudioManager.STREAM_ALARM);
-            mAudioManager.setStreamVolume(AudioManager.STREAM_ALARM, mAudioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM), AudioManager.FLAG_PLAY_SOUND);
+            volumeSaved = true;
+            try {
+                mAudioManager.setStreamVolume(AudioManager.STREAM_ALARM,
+                        mAudioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM), AudioManager.FLAG_PLAY_SOUND);
+            } catch (final RuntimeException e) { LOG.warn("Could not adjust Find Phone alarm volume", e); }
         }
+        return true;
     }
 
     private void stopVibration() {
-        mVibrator.cancel();
+        if (mVibrator != null) {
+            try { mVibrator.cancel(); }
+            catch (final RuntimeException e) { LOG.warn("Could not stop Find Phone vibration", e); }
+            mVibrator = null;
+        }
     }
 
     /**
@@ -177,6 +246,7 @@ public class FindPhoneActivity extends AbstractGBActivity {
             mp.setLooping(true);
             mp.prepare();
             mp.start();
+            LOG.info("Find Phone ringtone startup succeeded: owned={}", sessionToken != null);
         } catch (final Exception e) {
             LOG.warn("Failed to play configured ringtone", e);
             return false;
@@ -185,12 +255,11 @@ public class FindPhoneActivity extends AbstractGBActivity {
         return true;
     }
 
-    private void playFallbackRingtone() {
-        try {
-            final AssetFileDescriptor afd = getBaseContext().getResources().openRawResourceFd(R.raw.ping_tone);
+    private boolean playFallbackRingtone() {
+        try (final AssetFileDescriptor afd = getBaseContext().getResources().openRawResourceFd(R.raw.ping_tone)) {
             if (afd == null) {
                 LOG.error("Failed to load fallback ringtone");
-                return;
+                return false;
             }
 
             mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
@@ -198,21 +267,34 @@ public class FindPhoneActivity extends AbstractGBActivity {
             mp.setLooping(true);
             mp.prepare();
             mp.start();
+            LOG.info("Find Phone ringtone startup succeeded: owned={}", sessionToken != null);
         } catch (final Exception e) {
             LOG.warn("Failed to play fallback ringtone", e);
+            return false;
         }
+        return true;
     }
 
     private void stopSound() {
-        if (mAudioManager != null) {
-            mAudioManager.setStreamVolume(AudioManager.STREAM_ALARM, userVolume, AudioManager.FLAG_PLAY_SOUND);
-        }
         if (mp != null) {
-            mp.stop();
-            mp.reset();
-            mp.release();
+            try { mp.release(); }
+            catch (final RuntimeException e) { LOG.warn("Could not release Find Phone player", e); }
             mp = null;
         }
+        if (mAudioManager != null && volumeSaved) {
+            volumeSaved = false;
+            try { mAudioManager.setStreamVolume(AudioManager.STREAM_ALARM, userVolume, 0); }
+            catch (final RuntimeException e) { LOG.warn("Could not restore Find Phone alarm volume", e); }
+        }
+    }
+
+    @Override
+    public void finish() {
+        // Stop now, rather than waiting for Android's eventual onDestroy callback.
+        stopVibration();
+        stopSound();
+        if (sessionToken != null) FindPhoneSession.INSTANCE.finish(sessionToken, playbackFailed);
+        super.finish();
     }
 
     @Override
@@ -221,7 +303,11 @@ public class FindPhoneActivity extends AbstractGBActivity {
 
         stopVibration();
         stopSound();
-        GBApplication.deviceService().onFindPhone(false);
+        if (sessionToken != null) FindPhoneSession.INSTANCE.finish(sessionToken, playbackFailed);
+        if (legacyOwned) {
+            FindPhoneSession.INSTANCE.leaveLegacy();
+            GBApplication.deviceService().onFindPhone(false);
+        }
 
         LocalBroadcastManager.getInstance(this).unregisterReceiver(mReceiver);
         unregisterReceiver(mReceiver);

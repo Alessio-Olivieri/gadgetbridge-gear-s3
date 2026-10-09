@@ -50,6 +50,7 @@ import android.widget.Toast;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.annotation.RequiresPermission;
+import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 
@@ -63,7 +64,10 @@ import java.util.Locale;
 
 import nodomain.freeyourgadget.gadgetbridge.GBApplication;
 import nodomain.freeyourgadget.gadgetbridge.R;
+import nodomain.freeyourgadget.gadgetbridge.database.DBHandler;
+import nodomain.freeyourgadget.gadgetbridge.database.DBHelper;
 import nodomain.freeyourgadget.gadgetbridge.devices.DeviceCoordinator;
+import nodomain.freeyourgadget.gadgetbridge.devices.DeviceManager;
 import nodomain.freeyourgadget.gadgetbridge.impl.GBDevice;
 import nodomain.freeyourgadget.gadgetbridge.impl.GBDeviceCandidate;
 import nodomain.freeyourgadget.gadgetbridge.service.btle.BleNamesResolver;
@@ -206,6 +210,34 @@ public class BondingUtil {
      */
     public static void connectThenComplete(BondingInterface bondingInterface, GBDeviceCandidate deviceCandidate) {
         GBDevice device = DeviceHelper.getInstance().toSupportedDevice(deviceCandidate);
+        connectThenComplete(bondingInterface, device);
+    }
+
+    /**
+     * Persists a device selected for a coordinator that does not use Android bonding, then
+     * starts its first connection attempt. This keeps an externally bonded Classic device in
+     * Gadgetbridge even when the first connection attempt cannot initialize it.
+     */
+    public static void adoptThenConnect(BondingInterface bondingInterface, GBDeviceCandidate deviceCandidate) {
+        final GBDevice device = DeviceHelper.getInstance().toSupportedDevice(deviceCandidate);
+        if (device == null) {
+            GB.toast(bondingInterface.getContext(), "Unable to connect, can't recognize the device type", Toast.LENGTH_LONG, GB.ERROR);
+            return;
+        }
+
+        boolean persisted = false;
+        try (DBHandler dbHandler = GBApplication.acquireDB()) {
+            DBHelper.getDevice(device, dbHandler.getDaoSession());
+            persisted = true;
+        } catch (final Exception e) {
+            LOG.error("Failed to persist adopted device {}", device.getAddress(), e);
+        }
+
+        if (persisted) {
+            LocalBroadcastManager.getInstance(bondingInterface.getContext()).sendBroadcast(
+                    new Intent(DeviceManager.ACTION_REFRESH_DEVICELIST));
+        }
+
         connectThenComplete(bondingInterface, device);
     }
 

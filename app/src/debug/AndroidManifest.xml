@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Temporary captured-calendar-window migration, present in debug APKs only.
+             DUMP limits invocation to adb shell / privileged diagnostic callers. -->
+        <receiver
+            android:name=".service.devices.samsung.gear.sap.SapCalendarRangeImportReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="nodomain.freeyourgadget.gadgetbridge.debug.IMPORT_GEAR_S3_CALENDAR_RANGES" />
+            </intent-filter>
+        </receiver>
+        <!-- One-time Calendar mirror check/import. adb shell has DUMP; normal apps do not. -->
+        <receiver
+            android:name=".service.devices.samsung.gear.sap.SapCalendarMirrorBootstrapReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="nodomain.freeyourgadget.gadgetbridge.debug.INSPECT_GEAR_S3_CALENDAR_MIRROR" />
+                <action android:name="nodomain.freeyourgadget.gadgetbridge.debug.BOOTSTRAP_GEAR_S3_CALENDAR_MIRROR" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

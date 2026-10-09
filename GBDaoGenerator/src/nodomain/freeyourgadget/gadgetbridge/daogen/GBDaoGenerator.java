@@ -110,7 +110,7 @@ public class GBDaoGenerator {
             outputDir.mkdirs();
         }
 
-        final Schema schema = new Schema(151, MAIN_PACKAGE + ".entities");
+        final Schema schema = new Schema(152, MAIN_PACKAGE + ".entities");
 
         final List<Entity> sampleProvidersToGenerate = new LinkedList<>();
         final List<Entity> batterySampleProvidersToGenerate = new LinkedList<>();
@@ -237,6 +237,8 @@ public class GBDaoGenerator {
         sampleProvidersToGenerate.add(addMoyoungSleepStageSample(schema, user, device));
         sampleProvidersToGenerate.add(addMoyoungStressSample(schema, user, device));
         sampleProvidersToGenerate.add(addGloryFitStepsSample(schema, user, device));
+        addGearS3ActivitySample(schema, user, device);
+        addGearS3HeartRateSample(schema, user, device);
         addKeephealthActivitySample(schema, user, device);
         addKeephealthBloodPressureSample(schema, user, device);
         addKeephealthTemperatureSample(schema, user, device);
@@ -1525,6 +1527,49 @@ public class GBDaoGenerator {
         sleepStageSample.addIntProperty("walkingEnd").notNull();
         sleepStageSample.addIntProperty("walkingSteps").notNull();
         return sleepStageSample;
+    }
+
+    private static Entity addGearS3ActivitySample(Schema schema, Entity user, Entity device) {
+        Entity activitySample = addEntity(schema, "GearS3ActivitySample");
+        activitySample.implementsSerializable();
+        addCommonActivitySampleProperties("AbstractActivitySample", activitySample, user, device);
+        activitySample.addStringProperty("datauuid").notNull().unique();
+        activitySample.addIntProperty(SAMPLE_STEPS).notNull().codeBeforeGetterAndSetter(OVERRIDE);
+        activitySample.addIntProperty(SAMPLE_RAW_KIND).notNull().codeBeforeGetterAndSetter(OVERRIDE);
+        activitySample.addIntProperty(SAMPLE_RAW_INTENSITY).notNull().codeBeforeGetterAndSetter(OVERRIDE);
+        activitySample.addIntProperty("distanceCm").notNull().codeBeforeGetterAndSetter(OVERRIDE);
+        activitySample.addIntProperty("activeCalories").notNull().codeBeforeGetterAndSetter(OVERRIDE);
+        activitySample.addLongProperty("startTimeMs").notNull();
+        activitySample.addLongProperty("endTimeMs").notNull();
+        activitySample.addIntProperty("count").notNull();
+        activitySample.addIntProperty("walkStep").notNull();
+        activitySample.addIntProperty("runStep").notNull();
+        activitySample.addFloatProperty("distance").notNull();
+        activitySample.addFloatProperty("calorie").notNull();
+        activitySample.addLongProperty("duration").notNull();
+        activitySample.addFloatProperty("speed").notNull();
+        return activitySample;
+    }
+
+    private static Entity addGearS3HeartRateSample(Schema schema, Entity user, Entity device) {
+        Entity sample = addEntity(schema, "GearS3HeartRateSample");
+        sample.setSuperclass("AbstractHeartRateSample");
+        sample.addStringProperty("datauuid").notNull().primaryKey();
+        Property deviceId = sample.addLongProperty("deviceId").notNull().primaryKey()
+                .codeBeforeGetterAndSetter(OVERRIDE).getProperty();
+        sample.addToOne(device, deviceId);
+        Property userId = sample.addLongProperty("userId").notNull()
+                .codeBeforeGetterAndSetter(OVERRIDE).getProperty();
+        sample.addToOne(user, userId);
+        Property timestamp = sample.addLongProperty("timestamp").notNull()
+                .codeBeforeGetterAndSetter(OVERRIDE).getProperty();
+        Index byDeviceAndTime = new Index();
+        byDeviceAndTime.addProperty(deviceId);
+        byDeviceAndTime.addProperty(timestamp);
+        sample.addIndex(byDeviceAndTime);
+        sample.addLongProperty("endTimeMs").notNull();
+        sample.addIntProperty(SAMPLE_HEART_RATE).notNull().codeBeforeGetter(OVERRIDE);
+        return sample;
     }
 
     private static Entity addKeephealthActivitySample(Schema schema, Entity user, Entity device) {

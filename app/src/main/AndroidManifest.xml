@@ -20,6 +20,8 @@
     <!-- Needed to communicate with already-paired Bluetooth devices. -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Gear Host Manager answers the watch's one-shot data-network status request. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!-- Since Android 10 -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />

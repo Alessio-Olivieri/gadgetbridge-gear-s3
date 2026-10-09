@@ -61,6 +61,9 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.Strings;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -118,6 +121,7 @@ public class NotificationListener extends NotificationListenerService {
             = "nodomain.freeyourgadget.gadgetbridge.notificationlistener.action.mute";
     public static final String ACTION_REPLY
             = "nodomain.freeyourgadget.gadgetbridge.notificationlistener.action.reply";
+    public static final String EXTRA_REPLY_RESULT_RECEIVER = "reply_result_receiver";
 
     private final LimitedQueue<Integer, NotificationAction> mActionLookup = new LimitedQueue<>(128);
     private final LimitedQueue<Integer, String> mPackageLookup = new LimitedQueue<>(64);
@@ -261,12 +265,14 @@ public class NotificationListener extends NotificationListenerService {
                     NotificationListener.this.cancelAllNotifications();
                     break;
                 case ACTION_REPLY:
+                    final android.os.ResultReceiver replyResultReceiver = intent.getParcelableExtra(EXTRA_REPLY_RESULT_RECEIVER);
                     NotificationAction wearableAction = mActionLookup.lookup(handle);
                     String reply = intent.getStringExtra("reply");
                     if (wearableAction != null) {
                         PendingIntent actionIntent = wearableAction.getIntent();
                         if (actionIntent == null) {
                             LOG.warn("Action intent is null");
+                            if (replyResultReceiver != null) replyResultReceiver.send(0, null);
                             break;
                         }
 
@@ -286,11 +292,14 @@ public class NotificationListener extends NotificationListenerService {
                                 sendAllowingBackgroundActivityStart(actionIntent);
                             }
                             mActionLookup.remove(handle);
+                            if (replyResultReceiver != null) replyResultReceiver.send(1, null);
                         } catch (final PendingIntent.CanceledException e) {
                             LOG.warn("replyToLastNotification error", e);
+                            if (replyResultReceiver != null) replyResultReceiver.send(0, null);
                         }
                     } else {
                         LOG.warn("Received ACTION_REPLY for handle {}, but cannot find the corresponding wearableAction", handle);
+                        if (replyResultReceiver != null) replyResultReceiver.send(0, null);
                     }
                     break;
             }
@@ -511,6 +520,8 @@ public class NotificationListener extends NotificationListenerService {
         boolean preferBigText = prefs.getBoolean("notification_prefer_long_text", true);
 
         dissectNotificationTo(notification, notificationSpec, preferBigText);
+        populateSamsungMessagingStyle(notification, notificationSpec);
+        populateSamsungNotificationAvatar(notification, notificationSpec);
 
         if (notificationSpec.getTitle() != null || notificationSpec.getBody() != null) {
             final String textToCheck = ensureNotNull(notificationSpec.getTitle()) + " " + ensureNotNull(notificationSpec.getBody());
@@ -555,6 +566,7 @@ public class NotificationListener extends NotificationListenerService {
                 if (act.getRemoteInputs() != null && act.getRemoteInputs().length > 0) {
                     wearableAction.setType(NotificationSpec.Action.TYPE_WEARABLE_REPLY);
                     remoteInput = act.getRemoteInputs()[0];
+                    populateRemoteInput(wearableAction, remoteInput);
                 } else {
                     wearableAction.setType(NotificationSpec.Action.TYPE_WEARABLE_SIMPLE);
                     remoteInput = null;
@@ -583,6 +595,7 @@ public class NotificationListener extends NotificationListenerService {
                             .setAllowFreeFormInput(ri.getAllowFreeFormInput())
                             .addExtras(ri.getExtras())
                             .build();
+                    populateRemoteInput(customAction, remoteInput);
                 } else {
                     customAction.setType(NotificationSpec.Action.TYPE_CUSTOM_SIMPLE);
                     remoteInput = null;
@@ -978,6 +991,157 @@ public class NotificationListener extends NotificationListenerService {
                 && notificationSpec.getTitle() != null) {
             notificationSpec.setBody(notificationSpec.getTitle());
             notificationSpec.setTitle(null);
+        }
+    }
+
+    /**
+     * Protocol-v15 attr 44 is JSON with up to ten current and ten historic
+     * MessagingStyle entries containing sender, timestamp and text. Android
+     * keeps the self identity separately as the style user.
+     */
+    private void populateSamsungMessagingStyle(final Notification notification, final NotificationSpec spec) {
+        final NotificationCompat.MessagingStyle style = NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(notification);
+        if (style == null) return;
+        try {
+            final JSONObject root = new JSONObject();
+            if (style.getUser() != null && style.getUser().getName() != null) root.put("user_display_name", style.getUser().getName());
+            if (style.getConversationTitle() != null) root.put("conversation_title", style.getConversationTitle());
+            root.put("messages", samsungMessagesJson(style.getMessages()));
+            root.put("historicMessages", samsungMessagesJson(style.getHistoricMessages()));
+            spec.setMessagingStyleJson(root.toString());
+            final JSONArray snapshot = new JSONArray();
+            final ArrayList<NotificationCompat.MessagingStyle.Message> all = new ArrayList<>(style.getHistoricMessages());
+            all.addAll(style.getMessages());
+            for (final NotificationCompat.MessagingStyle.Message message : all) {
+                final JSONObject item = new JSONObject();
+                item.put("time", message.getTimestamp());
+                item.put("sender", samsungMessageIsSelf(style, message) ? "self" : samsungPersonIdentity(message.getPerson()));
+                item.put("self", samsungMessageIsSelf(style, message));
+                item.put("text", message.getText() == null ? "" : message.getText().toString());
+                snapshot.put(item);
+            }
+            spec.setSamsungMessagingSnapshot(snapshot.toString());
+            populateSamsungBigPictureCompatibilityCandidate(style, spec);
+            LOG.debug("Gear S3 NotificationService richHistory: current={} historic={} serialized={} senderRuns={} media={}",
+                    style.getMessages().size(), style.getHistoricMessages().size(),
+                    Math.min(10, style.getMessages().size()) + Math.min(10, style.getHistoricMessages().size()),
+                    samsungSenderRuns(style), samsungMediaSummary(style));
+        } catch (final JSONException e) {
+            LOG.warn("Unable to serialize MessagingStyle for Samsung NotificationService", e);
+        }
+    }
+
+    /**
+     * Attr 23 carries BigPicture PNG data. Its applicability to category-1006
+     * MessagingStyle remains uncertain. Keep only URI metadata here; the Gear
+     * worker performs all image I/O and compression.
+     */
+    static void populateSamsungBigPictureCompatibilityCandidate(final NotificationCompat.MessagingStyle style,
+                                                                         final NotificationSpec spec) {
+        spec.setSamsungBigPictureMediaUri(null);
+        spec.setSamsungBigPictureMediaMimeType(null);
+        final List<NotificationCompat.MessagingStyle.Message> messages = style.getMessages().isEmpty()
+                ? style.getHistoricMessages() : style.getMessages();
+        if (messages.isEmpty()) return;
+        final NotificationCompat.MessagingStyle.Message message = messages.get(messages.size() - 1);
+        final String mime = message.getDataMimeType();
+        final boolean media = message.getDataUri() != null && mime != null && mime.startsWith("image/");
+        if (media) {
+            spec.setSamsungBigPictureMediaUri(message.getDataUri().toString());
+            spec.setSamsungBigPictureMediaMimeType(mime);
+        }
+        LOG.debug("mediaStyle: latestMessageMedia={} mime={}", media, media ? mime : "none");
+    }
+
+    private static String samsungPersonIdentity(final androidx.core.app.Person person) {
+        if (person == null) return "self";
+        if (person.getKey() != null && !person.getKey().isEmpty()) return "key:" + person.getKey();
+        if (person.getUri() != null && !person.getUri().isEmpty()) return "uri:" + person.getUri();
+        return "name:" + (person.getName() == null ? "" : person.getName().toString());
+    }
+
+    static boolean samsungMessageIsSelf(final NotificationCompat.MessagingStyle style,
+                                               final NotificationCompat.MessagingStyle.Message message) {
+        // Android defines a null sender as a message from the MessagingStyle user.
+        if (message.getPerson() == null) return true;
+        if (style.getUser() == null) return false;
+        final String identity = samsungPersonIdentity(message.getPerson());
+        return !identity.equals("name:") && identity.equals(samsungPersonIdentity(style.getUser()));
+    }
+
+    private static JSONArray samsungMessagesJson(final List<NotificationCompat.MessagingStyle.Message> messages) throws JSONException {
+        final JSONArray result = new JSONArray();
+        final int start = Math.max(0, messages.size() - 10); // Maximum entries per MessagingStyle list
+        for (int i = start; i < messages.size(); i++) {
+            final NotificationCompat.MessagingStyle.Message message = messages.get(i);
+            final JSONObject encoded = new JSONObject();
+            if (message.getPerson() != null && message.getPerson().getName() != null) encoded.put("mSender", message.getPerson().getName());
+            encoded.put("mTimestamp", message.getTimestamp());
+            if (message.getText() != null) encoded.put("mText", message.getText());
+            result.put(encoded);
+        }
+        return result;
+    }
+
+    /** Privacy-safe diagnostic using the same null-sender / Person identity rules as delta extraction. */
+    private static String samsungSenderRuns(final NotificationCompat.MessagingStyle style) {
+        final StringBuilder runs = new StringBuilder();
+        String previous = null;
+        final ArrayList<NotificationCompat.MessagingStyle.Message> all = new ArrayList<>();
+        all.addAll(style.getHistoricMessages());
+        all.addAll(style.getMessages());
+        for (final NotificationCompat.MessagingStyle.Message message : all) {
+            final String role = samsungMessageIsSelf(style, message) ? "self" : "remote";
+            if (!role.equals(previous)) { if (runs.length() > 0) runs.append('/'); runs.append(role); previous = role; }
+        }
+        return runs.toString();
+    }
+
+    private static String samsungMediaSummary(final NotificationCompat.MessagingStyle style) {
+        int count = 0;
+        final Set<String> mimeTypes = new HashSet<>();
+        final ArrayList<NotificationCompat.MessagingStyle.Message> all = new ArrayList<>();
+        all.addAll(style.getHistoricMessages());
+        all.addAll(style.getMessages());
+        for (final NotificationCompat.MessagingStyle.Message message : all) {
+            if (message.getDataUri() == null) continue;
+            count++;
+            mimeTypes.add(message.getDataMimeType() == null ? "unknown" : message.getDataMimeType());
+        }
+        return count + ":" + mimeTypes;
+    }
+
+    /** Icon priority: extra large icon, framework large icon, then the last message's Person icon. */
+    private void populateSamsungNotificationAvatar(final Notification notification, final NotificationSpec spec) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+        Icon icon = notification.getLargeIcon();
+        if (icon != null) {
+            // Icon is Parcelable: defer Drawable loading, bitmap rasterization and PNG encoding to
+            // the Gear NotificationService's single preparation worker.
+            spec.setAvatarIcon(icon);
+            return;
+        }
+        if (icon == null) {
+            final NotificationCompat.MessagingStyle style = NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(notification);
+            if (style != null && !style.getMessages().isEmpty()) {
+                final NotificationCompat.MessagingStyle.Message last = style.getMessages().get(style.getMessages().size() - 1);
+                if (last.getPerson() != null && last.getPerson().getIcon() != null) {
+                    spec.setAvatarIcon(last.getPerson().getIcon().toIcon());
+                    return;
+                }
+            }
+        }
+    }
+
+    private static void populateRemoteInput(final NotificationSpec.Action action, final RemoteInput input) {
+        action.setRemoteInputKey(input.getResultKey());
+        action.setRemoteInputLabel(input.getLabel() == null ? null : input.getLabel().toString());
+        action.setRemoteInputAllowFreeInput(input.getAllowFreeFormInput());
+        final CharSequence[] choices = input.getChoices();
+        if (choices != null) {
+            final String[] strings = new String[choices.length];
+            for (int i = 0; i < choices.length; i++) strings[i] = choices[i] == null ? "" : choices[i].toString();
+            action.setRemoteInputChoices(strings);
         }
     }
 

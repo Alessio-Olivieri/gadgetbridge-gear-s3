@@ -73,7 +73,6 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -323,20 +322,16 @@ public class DiscoveryActivityV2 extends AbstractGBActivity implements AdapterVi
 
         refreshDeviceList(false);
 
-        // Pre-add currently connected devices, as those will not trigger discovery events
-        // Paired devices that are not connected do not need to be added, as those will be discovered
+        // Pre-add bonded Classic-capable devices. A device that is already bonded does not
+        // necessarily become discoverable again after its ACL link is closed.
         try {
             final Set<BluetoothDevice> pairedDevices = BluetoothAdapter.getDefaultAdapter().getBondedDevices();
             for (final BluetoothDevice device : pairedDevices) {
-                try {
-                    @SuppressWarnings("JavaReflectionMemberAccess") final Method isConnectedMethod = device.getClass().getMethod("isConnected");
-                    final Boolean isConnected = (Boolean) isConnectedMethod.invoke(device);
-                    if (isConnected != null && isConnected) {
-                        LOG.debug("Pre-adding already bonded device {}", device.getAddress());
-                        deviceFoundProcessor.scheduleProcessing(new GBScanEvent(device, (short) -1, device.getUuids(), null));
-                    }
-                } catch (final Exception e) {
-                    LOG.error("Failed to check whether {} is connected", device.getAddress());
+                final int deviceType = device.getType();
+                if (deviceType == BluetoothDevice.DEVICE_TYPE_CLASSIC ||
+                        deviceType == BluetoothDevice.DEVICE_TYPE_DUAL) {
+                    LOG.debug("Pre-adding bonded Classic-capable device {}", device.getAddress());
+                    deviceFoundProcessor.scheduleProcessing(new GBScanEvent(device, (short) -1, device.getUuids(), null));
                 }
             }
         } catch (final SecurityException e) {
@@ -738,8 +733,12 @@ public class DiscoveryActivityV2 extends AbstractGBActivity implements AdapterVi
             intent.putParcelableArrayListExtra(DeviceCoordinator.EXTRA_DEVICE_ALL_CANDIDATES, deviceCandidates);
             startActivityForResult(intent, CHILD_RESULT);
         } else {
-            if (coordinator.getBondingStyle() == DeviceCoordinator.BONDING_STYLE_NONE ||
-                    coordinator.getBondingStyle() == DeviceCoordinator.BONDING_STYLE_LAZY) {
+            if (coordinator.getBondingStyle() == DeviceCoordinator.BONDING_STYLE_NONE) {
+                LOG.info("No bonding needed, according to coordinator, so connecting right away");
+                BondingUtil.adoptThenConnect(this, deviceCandidate);
+                return;
+            }
+            if (coordinator.getBondingStyle() == DeviceCoordinator.BONDING_STYLE_LAZY) {
                 LOG.info("No bonding needed, according to coordinator, so connecting right away");
                 BondingUtil.connectThenComplete(this, deviceCandidate);
                 return;

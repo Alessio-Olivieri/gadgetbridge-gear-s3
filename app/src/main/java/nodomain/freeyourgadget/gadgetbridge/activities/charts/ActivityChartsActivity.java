@@ -131,6 +131,14 @@ public class ActivityChartsActivity extends AbstractGBActivity implements Charts
                         refreshBusyState(dev);
                     }
                     break;
+                case GBApplication.ACTION_NEW_DATA: {
+                    final GBDevice dataDevice = intent.getParcelableExtra(GBDevice.EXTRA_DEVICE);
+                    if (mGBDevice.equals(dataDevice)) {
+                        LocalBroadcastManager.getInstance(ActivityChartsActivity.this)
+                                .sendBroadcast(new Intent(REFRESH));
+                    }
+                    break;
+                }
             }
         }
     };
@@ -185,6 +193,7 @@ public class ActivityChartsActivity extends AbstractGBActivity implements Charts
 
         final IntentFilter filterLocal = new IntentFilter();
         filterLocal.addAction(GBDevice.ACTION_DEVICE_CHANGED);
+        filterLocal.addAction(GBApplication.ACTION_NEW_DATA);
         LocalBroadcastManager.getInstance(this).registerReceiver(mReceiver, filterLocal);
 
         // Open the specified fragment, if any, and setup single page view if specified

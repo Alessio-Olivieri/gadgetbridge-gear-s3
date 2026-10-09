@@ -2031,6 +2031,7 @@
     <string name="add_test_device">Add test device</string>
     <string name="set_device_type">Set device type</string>
     <string name="devicetype_pebble" translatable="false">Pebble</string>
+    <string name="devicetype_samsung_gear_s3" translatable="false">Samsung Gear S3 Frontier</string>
     <string name="devicetype_miband" translatable="false">Mi Band</string>
     <string name="devicetype_miband2" translatable="false">Mi Band 2</string>
     <string name="devicetype_miband3" translatable="false">Mi Band 3</string>

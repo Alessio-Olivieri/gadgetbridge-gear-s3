@@ -212,14 +212,13 @@ public final class BtBRQueue {
                                 readThread = createReadThread();
                             }
 
-                            // now that connect has been created, start the threads
-                            readThread.start();
-
-                            // An aux socket must not touch the primary device state or re-run init.
-                            if (!mIsAux) {
-                                setDeviceConnectionState(GBDevice.State.CONNECTED);
-                                onConnectionEstablished();
-                            }
+                            initializeBeforeRead(() -> {
+                                // A peer may send its first frame immediately after RFCOMM connect.
+                                if (!mIsAux) {
+                                    setDeviceConnectionState(GBDevice.State.CONNECTED);
+                                    onConnectionEstablished();
+                                }
+                            }, readThread::start);
                         } catch (IOException e) {
                             LOG.error("IO exception while establishing socket connection: ", e);
 
@@ -289,6 +288,11 @@ public final class BtBRQueue {
                 LOG.warn("Unhandled write handler message {}", msg.what);
             }
         };
+    }
+
+    static void initializeBeforeRead(final Runnable initialization, final Runnable startRead) {
+        initialization.run();
+        startRead.run();
     }
 
     /**
