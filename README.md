@@ -1,3 +1,22 @@
+> **Independent Gear S3 development based on Gadgetbridge.** This is an experimental fork and is **not** an official Gadgetbridge release or an upstream-merged feature. The original upstream project and its contributors are credited below; all existing licences remain applicable.
+
+## Samsung Gear S3 support — independent development
+
+This repository publishes my Android-side integration of the **Samsung Gear S3 (Tizen)** into Gadgetbridge, with the goal of supporting core smartwatch functionality without Samsung's companion applications.
+
+**Implemented/included in this fork:** Gear S3 device communication and connection management, notification delivery and interactive notification actions/replies, supporting protocol components and tests. Work has been exercised with physical devices; compatibility across firmware versions and all watch functions is **not guaranteed**.
+
+- [Gear S3 support source](app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/samsung/gear/)
+- [Gear S3 implementation commit](https://github.com/Alessio-Olivieri/gadgetbridge-gear-s3/commit/d0f3e28a350d463ff8f61c2699597b5f6b2c70ba)
+- [Original Gadgetbridge project](https://codeberg.org/Freeyourgadget/Gadgetbridge)
+- [Gadgetbridge contribution guidance](https://gadgetbridge.org/internals/development/project-overview/)
+
+This fork's Gear S3 work is independent and in development. **Do not use the official app's F-Droid/Codeberg download links below as evidence that this fork's Gear S3 support is included upstream.** Build and install this fork separately for testing.
+
+---
+
+## Original Gadgetbridge README
+
 Gadgetbridge is hosted on [codeberg.org](https://codeberg.org/Freeyourgadget/Gadgetbridge/).
 
 
