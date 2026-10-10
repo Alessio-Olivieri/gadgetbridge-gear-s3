@@ -58,6 +58,48 @@ public final class SapCalendarMirrorStore {
         }
     }
 
+    public String debugEmptyBootstrapRefusal() {
+        if (!BuildConfig.DEBUG || writeFailed) return "support-unavailable";
+        try {
+            final String state = preferences.getString(STATE_KEY, "");
+            if (TRUSTED.equals(state)) return "mirror-not-unknown";
+            // A completed date-window request does not itself write watch events.
+            if (!"".equals(state) && !"range-change".equals(state)) return "interrupted-operation";
+            final String previous = preferences.getString(MIRROR_KEY, "");
+            if (!"".equals(previous)) {
+                // A date-window change can retain an obsolete EMPTY checkpoint. It is not
+                // a trusted baseline or uncertain write. Only this debug recovery, backed
+                // by a new external empty-DB proof, may replace it; never accept old rows.
+                if (!"range-change".equals(state)) return "mirror-not-unknown";
+                if (previous == null || previous.length() > MAX_JSON_CHARS) return "mirror-state-invalid";
+                final JSONObject checkpoint = new JSONObject(previous);
+                if (checkpoint.getInt("version") != 1 || checkpoint.getLong("sequence") != 0
+                        || checkpoint.getJSONArray("events").length() != 0) return "mirror-not-unknown";
+                checkpoint.getString("phoneZone");
+                if (new JSONArray(checkpoint.getString("ranges")).length() == 0) return "mirror-state-invalid";
+            }
+            return null;
+        } catch (final JSONException | RuntimeException ignored) {
+            return "mirror-state-invalid";
+        }
+    }
+
+    /** Explicit debug-only empty DB attestation; never import Android rows as an empty-watch mirror. */
+    public boolean debugBootstrapEmpty(final String databaseSha256, final String expectedRanges,
+                                       final String phoneZone) {
+        if (debugEmptyBootstrapRefusal() != null || databaseSha256 == null
+                || !databaseSha256.matches("[0-9a-f]{64}")) return false;
+        try {
+            final SapCalendarBootstrap.Plan plan = SapCalendarBootstrap.inspectEmpty(preferences,
+                    java.util.TimeZone.getTimeZone(phoneZone));
+            if (!plan.phoneZone.equals(phoneZone) || !plan.ranges.equals(expectedRanges)) return false;
+            return writeCheckpoint(java.util.Collections.emptyList(), 0, phoneZone, databaseSha256,
+                    false, "debug-empty-watch-db-verified-v1");
+        } catch (final JSONException | RuntimeException ignored) {
+            return false;
+        }
+    }
+
     public String restore(final SapCalendarSnapshot snapshot, final String phoneZone) {
         snapshot.clear();
         try {
@@ -91,6 +133,7 @@ public final class SapCalendarMirrorStore {
                 events.add(event);
             }
             snapshot.restoreTrusted(events);
+            if ("debug-empty-watch-db-verified-v1".equals(root.optString("provenance"))) return "trusted-debug-empty-bootstrap";
             return "debug-bootstrap-watch-db-verified-v1".equals(root.optString("provenance"))
                     ? "trusted-debug-bootstrap" : "trusted";
         } catch (final JSONException | RuntimeException ignored) {
@@ -131,6 +174,13 @@ public final class SapCalendarMirrorStore {
 
     private boolean writeCheckpoint(final List<CalendarEvent> events, final long sequence, final String phoneZone,
                                     final String verifiedFingerprint, final boolean clearPendingRefresh) {
+        return writeCheckpoint(events, sequence, phoneZone, verifiedFingerprint, clearPendingRefresh,
+                "debug-bootstrap-watch-db-verified-v1");
+    }
+
+    private boolean writeCheckpoint(final List<CalendarEvent> events, final long sequence, final String phoneZone,
+                                    final String verifiedFingerprint, final boolean clearPendingRefresh,
+                                    final String provenance) {
         try {
             final SapCalendarRangeStore.State state = new SapCalendarRangeStore(preferences).load();
             if (state.replaceOnNextRange || state.ranges.isEmpty()) return false;
@@ -141,7 +191,7 @@ public final class SapCalendarMirrorStore {
                     .put("phoneZone", phoneZone)
                     .put("ranges", preferences.getString(SapCalendarRangeStore.RANGES_KEY, ""))
                     .put("events", rows);
-            if (verifiedFingerprint != null) checkpoint.put("provenance", "debug-bootstrap-watch-db-verified-v1")
+            if (verifiedFingerprint != null) checkpoint.put("provenance", provenance)
                     .put("verifiedFingerprint", verifiedFingerprint);
             final String value = checkpoint.toString();
             if (value.length() > MAX_JSON_CHARS) return false;

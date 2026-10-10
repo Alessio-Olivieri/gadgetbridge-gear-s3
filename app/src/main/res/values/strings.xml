@@ -6045,4 +6045,6 @@
     <string name="datestep_next_week">Next week</string>
     <string name="datestep_prev_month">Previous month</string>
     <string name="datestep_next_month">Next month</string>
+    <string name="gear_s3_contacts_first_sync_title">Replace watch contacts on first sync</string>
+    <string name="gear_s3_contacts_first_sync_summary">When Gadgetbridge has no saved Contacts sync state, first sync can erase existing watch contacts and copy phone contacts. Save any watch-only contacts first. Enable once, then reconnect the Gear to begin. Existing sync state is never reset by this option.</string>
 </resources>

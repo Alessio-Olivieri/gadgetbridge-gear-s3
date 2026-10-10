@@ -1,6 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
+        <receiver
+            android:name=".service.devices.samsung.gear.sap.SapCalendarEmptyMirrorBootstrapReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="nodomain.freeyourgadget.gadgetbridge.debug.INSPECT_GEAR_S3_EMPTY_CALENDAR_MIRROR" />
+                <action android:name="nodomain.freeyourgadget.gadgetbridge.debug.BOOTSTRAP_GEAR_S3_EMPTY_CALENDAR_MIRROR" />
+            </intent-filter>
+        </receiver>
         <!-- Temporary captured-calendar-window migration, present in debug APKs only.
              DUMP limits invocation to adb shell / privileged diagnostic callers. -->
         <receiver

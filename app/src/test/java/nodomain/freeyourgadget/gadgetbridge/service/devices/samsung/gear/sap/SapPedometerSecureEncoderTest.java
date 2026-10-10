@@ -64,9 +64,9 @@ public class SapPedometerSecureEncoderTest {
     }
 
     @Test
-    public void syntheticRichResponseUsesExactModernDiscriminatorsAndMinimalSchema() throws Exception {
+    public void richResponseUsesExactModernDiscriminatorsAndMinimalSchema() throws Exception {
         final JSONObject response = new JSONObject(new String(
-                SapPedometerCapabilityResponse.syntheticRichResponseJson(
+                SapPedometerCapabilityResponse.richResponseJson(
                         contextWithSamsungHealthVersion(7006011L)), StandardCharsets.UTF_8));
         assertEquals(SapPedometerCapabilityResponse.RESPONSE, response.getString("capability_type"));
         assertEquals(SapPedometerCapabilityResponse.RICH_RESPONSE, response.getString("message_type"));
@@ -79,10 +79,10 @@ public class SapPedometerSecureEncoderTest {
     }
 
     @Test
-    public void syntheticRichResponseUsesExistingUncompressedHealthTxPath() throws Exception {
+    public void richResponseUsesExistingUncompressedHealthTxPath() throws Exception {
         final SapPedometerSecureEncoder encoder = new SapPedometerSecureEncoder(new SapHostManagerAppCipher(KEY));
         final SapPedometerSecureEncoder.EncodedFrame frame = encoder.encode(
-                SapPedometerCapabilityResponse.syntheticRichResponseJson(
+                SapPedometerCapabilityResponse.richResponseJson(
                         contextWithSamsungHealthVersion(7006011L)));
         assertEquals(0x04, frame.getSdk());
         assertFalse(frame.isCompressed());

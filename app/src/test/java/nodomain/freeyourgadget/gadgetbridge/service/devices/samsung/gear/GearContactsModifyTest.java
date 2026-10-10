@@ -72,7 +72,7 @@ public class GearContactsModifyTest {
     private Provider provider;
     private String original;
     private String failSend;
-    private boolean dropQueuedSetup, requireDurablePayloadMarker;
+    private boolean dropQueuedSetup, requireDurablePayloadMarker, requireConsentConsumed;
     private boolean emitterConnected = true;
     private int reconnectRequests;
 
@@ -121,6 +121,7 @@ public class GearContactsModifyTest {
                     @Override public boolean isConnected() { return emitterConnected; }
                     @Override public void reconnect(GearContactsService requester) { assertSame(service, requester); reconnectRequests++; }
                     @Override public void send(SapPostAuthRecord record) {
+                        if (requireConsentConsumed) assertFalse(prefs.getBoolean(GearContactsService.ALLOW_FIRST_SYNC, false));
                         final int session = record.getHeader().getSessionId();
                         final byte[] body = record.getBody();
                         if (requireDurablePayloadMarker && session == integer("ftDataSession"))
@@ -276,6 +277,32 @@ public class GearContactsModifyTest {
         ShadowLooper.shadowMainLooper().idleFor(Duration.ofSeconds(2)); assertTrue(integer("pendingContacts") > 0); assertEquals(0, setups());
     }
 
+    @Test public void invalidSessionRejectionRetriesWithoutWaitingForHandshakeOrChangingLedger() throws Exception {
+        create(); resume(); controlLost(); provider.rows.put(3L, CURRENT); observedChange();
+        final int old = integer("pendingContacts");
+        assertTrue(service.acceptResponse(new SapServiceConnectionResponse(20, integer("contactsComponent"),
+                GearContactsService.CONTACTS, 1, Collections.singletonList(0xffff))));
+        assertEquals(-1, integer("pendingContacts"));
+        assertEquals("DISCONNECTED", get(service, "controlState").toString());
+        assertFalse((Boolean) get(service, "controlReady"));
+        ShadowLooper.shadowMainLooper().idleFor(Duration.ofSeconds(2));
+        assertTrue(integer("pendingContacts") > 0);
+        assertNotEquals(old, integer("pendingContacts"));
+        assertEquals(0, setups());
+        assertEquals(original, prefs.getString(SNAPSHOT, null));
+        assertFalse(snapshot().isBlocked(3));
+    }
+
+    @Test public void unrelatedInvalidSessionRejectionCannotRetirePendingContactsRequest() throws Exception {
+        create(); resume(); controlLost(); provider.rows.put(3L, CURRENT); observedChange();
+        final int pending = integer("pendingContacts");
+        assertFalse(service.acceptResponse(new SapServiceConnectionResponse(21, integer("contactsComponent"),
+                GearContactsService.CONTACTS, 1, Collections.singletonList(0xffff))));
+        assertFalse(service.acceptResponse(new SapServiceConnectionResponse(20, integer("contactsComponent"),
+                GearContactsService.CONTACTS, 0, Collections.singletonList(0xffff))));
+        assertEquals(pending, integer("pendingContacts"));
+    }
+
     @Test public void lateOldConnectionResponseCannotPoisonRetryRequest() throws Exception {
         create(); resume(); controlLost(); provider.rows.put(3L, CURRENT); observedChange(); final int old = integer("pendingContacts");
         stalledControl(); ShadowLooper.shadowMainLooper().idleFor(Duration.ofSeconds(2)); final int current = integer("pendingContacts");
@@ -406,6 +433,7 @@ public class GearContactsModifyTest {
     }
 
     @Test public void realInitialCancelsHandshakeRecoveryWithoutChangingInitialImportGating() throws Exception {
+        prefs.edit().clear().putBoolean(GearContactsService.ALLOW_FIRST_SYNC, true).commit(); // Explicitly authorized synthetic first sync; no local baseline.
         create(); controlBack(); final Runnable old = (Runnable) get(service, "controlWatchdog");
         invoke("onContactMessage", byte[].class, "Request_Initial_Sync_Contact".getBytes(StandardCharsets.UTF_8)); drain();
         assertNull(get(service, "controlWatchdog")); old.run(); assertEquals("READY", get(service, "controlState").toString());
@@ -883,6 +911,7 @@ public class GearContactsModifyTest {
     }
 
     @Test public void initialControlAllowsFirstGenerationImportButOldCompletionCannotAuthorizeNewGeneration() throws Exception {
+        prefs.edit().clear().putBoolean(GearContactsService.ALLOW_FIRST_SYNC, true).commit(); // First import requires consent and no retained local state.
         create(); invoke("onContactMessage", byte[].class, "Request_Initial_Sync_Contact".getBytes(StandardCharsets.UTF_8)); drain();
         assertTrue((Boolean) get(service, "pendingInitial")); assertEquals(1, setups());
         controlLost(); controlBack(); complete(); assertTrue(snapshot().isInitialized()); assertFalse((Boolean) get(service, "controlReady"));
@@ -1017,13 +1046,93 @@ public class GearContactsModifyTest {
         assertTrue(snapshot().isTransportUncertain(1)); assertTrue(snapshot().isTransportUncertain(2));
     }
 
+    @Test public void missingBaselineResumeCannotTriggerWatchResetWithoutConsent() throws Exception {
+        prefs.edit().clear().commit(); create();
+        final Map<String, ?> before = prefs.getAll();
+        resume(); resume();
+        assertTrue(emitted.isEmpty()); assertTrue(files().isEmpty());
+        assertEquals(before, prefs.getAll()); assertFalse(snapshot().isInitialized());
+    }
+
+    @Test public void missingBaselineUnsolicitedInitialRequiresConsent() throws Exception {
+        prefs.edit().clear().commit(); create();
+        final Map<String, ?> before = prefs.getAll();
+        invoke("onContactMessage", byte[].class, "Request_Initial_Sync_Contact".getBytes(StandardCharsets.UTF_8)); drain();
+        assertTrue(emitted.isEmpty()); assertTrue(files().isEmpty()); assertEquals(0, setups());
+        assertEquals(before, prefs.getAll()); assertFalse(snapshot().isInitialized());
+    }
+
+    @Test public void firstSyncConsentIsConsumedBeforeInitialRequiredAndNotRestoredByProcessRestart() throws Exception {
+        prefs.edit().clear().putBoolean(GearContactsService.ALLOW_FIRST_SYNC, true).commit(); requireConsentConsumed = true; create(); resume();
+        assertFalse(prefs.getBoolean(GearContactsService.ALLOW_FIRST_SYNC, false));
+        assertEquals("Response_Initial_Sync_Required_Contact", new String(GearContactsCodec.payload(emitted.get(emitted.size()-1).getBody()), StandardCharsets.UTF_8));
+        service.dispose(); debug.close(); emitted.clear(); create(); resume();
+        assertTrue(emitted.isEmpty()); assertTrue(files().isEmpty());
+    }
+
+    @Test public void firstSyncConsentCannotResetRetainedBaseline() throws Exception {
+        prefs.edit().putBoolean(GearContactsService.ALLOW_FIRST_SYNC, true).commit(); create(); resume();
+        emitted.clear();
+        invoke("onContactMessage", byte[].class, "Request_Initial_Sync_Contact".getBytes(StandardCharsets.UTF_8)); drain();
+        assertTrue(emitted.isEmpty()); assertTrue(files().isEmpty());
+        assertEquals(original, prefs.getString(SNAPSHOT, null));
+    }
+
+    @Test public void firstSyncConsentDoesNotAuthorizeAnotherControlGeneration() throws Exception {
+        prefs.edit().clear().putBoolean(GearContactsService.ALLOW_FIRST_SYNC, true).commit(); create(); resume();
+        set("controlGeneration", 1L); emitted.clear(); resume();
+        assertTrue(emitted.isEmpty()); assertTrue(files().isEmpty());
+    }
+
+    @Test public void repeatedResumeDuringAuthorizedInitialCannotRequestAnotherWatchReset() throws Exception {
+        prefs.edit().clear().putBoolean(GearContactsService.ALLOW_FIRST_SYNC, true).commit(); create(); resume();
+        invoke("onContactMessage", byte[].class, "Request_Initial_Sync_Contact".getBytes(StandardCharsets.UTF_8)); drain();
+        final int count = emitted.size(); final Object file = files().peek();
+        resume(); assertEquals(count, emitted.size()); assertSame(file, files().peek());
+        assertEquals(1, setups());
+    }
+
     @Test public void explicitInitialStillUsesOnlyIAndCheckpointsAtFinalDelivery() throws Exception {
+        prefs.edit().clear().putBoolean(GearContactsService.ALLOW_FIRST_SYNC, true).commit(); // Fresh synthetic device: no retained transport state.
         provider.rows.put(1L, CURRENT); create();
         invoke("onContactMessage", byte[].class, "Request_Initial_Sync_Contact".getBytes(StandardCharsets.UTF_8)); drain();
         assertTrue((Boolean) get(service, "pendingInitial")); assertFalse((Boolean) get(service, "pendingReplacement"));
         assertTrue(decode(files().peek()).has("insert")); assertFalse(snapshot().isInitialized());
         complete(); assertTrue(snapshot().isInitialized()); assertFalse(snapshot().hasPendingVerification());
         assertTrue(snapshot().compare(GearContactsSource.read(context), false).isEmpty());
+    }
+
+    @Test public void initialRequestWithRetainedBaselineCannotReplayOrResetLedger() throws Exception {
+        create();
+        final GearContactsSnapshot retained = snapshot();
+        assertTrue(retained.beginTransport(Collections.singleton(3L)));
+        assertTrue(retained.recordTransportDelivered(Collections.singletonMap(3L, GearContactsSnapshot.fingerprint(contact(3, CURRENT)))));
+        service.persistentTestStateChanged();
+        final String ledger = prefs.getString("samsung_gear_contacts_transport_ledger_v1", null);
+        invoke("onContactMessage", byte[].class, "crypt_Request_Initial_Sync_Contact".getBytes(StandardCharsets.UTF_8)); drain();
+        assertEquals(0, setups());
+        assertTrue(files().isEmpty());
+        assertFalse((Boolean) get(service, "initialPending"));
+        assertEquals(original, prefs.getString(SNAPSHOT, null));
+        assertEquals(ledger, prefs.getString("samsung_gear_contacts_transport_ledger_v1", null));
+        assertTrue(snapshot().isInitialized());
+    }
+
+    @Test public void repeatedInitialCannotResetAnActiveFreshImportOrEnqueueAnotherFile() throws Exception {
+        prefs.edit().clear().putBoolean(GearContactsService.ALLOW_FIRST_SYNC, true).commit();
+        create();
+        invoke("onContactMessage", byte[].class, "crypt_Request_Initial_Sync_Contact".getBytes(StandardCharsets.UTF_8)); drain();
+        final Object file = files().peek();
+        final long readyGeneration = (long) get(service, "readyControlGeneration");
+        invoke("onContactMessage", byte[].class, "crypt_Request_Initial_Sync_Contact".getBytes(StandardCharsets.UTF_8)); drain();
+        assertSame(file, files().peek());
+        assertEquals(1, setups());
+        assertEquals(readyGeneration, get(service, "readyControlGeneration"));
+        complete();
+        assertTrue(snapshot().isInitialized());
+        invoke("onContactMessage", byte[].class, "crypt_Request_Initial_Sync_Contact".getBytes(StandardCharsets.UTF_8)); drain();
+        assertEquals(1, setups());
+        assertTrue(snapshot().isInitialized());
     }
 
     @Test public void explicitInitialDuringReplacementCannotClearUncertaintyOrReimport() throws Exception {
@@ -2059,6 +2168,7 @@ public class GearContactsModifyTest {
         @Override public Cursor query(Uri uri, String[] columns, String where, String[] args, String order) {
             MatrixCursor cursor = new MatrixCursor(columns);
             if (uri.equals(ContactsContract.RawContacts.CONTENT_URI)) { scans++; for (long id : rows.keySet()) cursor.addRow(new Object[]{id, id + 1000, "Synthetic Person", 0}); }
+            else if (uri.equals(ContactsContract.Contacts.CONTENT_URI)) for (long id : rows.keySet()) cursor.addRow(new Object[]{id + 1000, id});
             else if (uri.equals(ContactsContract.Data.CONTENT_URI)) for (Map.Entry<Long, String> row : rows.entrySet()) cursor.addRow(new Object[]{row.getKey(), ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE, row.getValue(), "2", null, null, 1});
             return cursor;
         }

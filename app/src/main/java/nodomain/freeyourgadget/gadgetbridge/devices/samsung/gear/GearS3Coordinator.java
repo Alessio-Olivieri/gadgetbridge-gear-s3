@@ -102,7 +102,7 @@ public class GearS3Coordinator extends AbstractBLClassicDeviceCoordinator {
 
     @Override
     public int[] getSupportedDeviceSpecificSettings(final GBDevice device) {
-        return new int[]{R.xml.devicesettings_sync_calendar};
+        return new int[]{R.xml.devicesettings_sync_calendar, R.xml.devicesettings_gear_s3_contacts};
     }
 
     @Override

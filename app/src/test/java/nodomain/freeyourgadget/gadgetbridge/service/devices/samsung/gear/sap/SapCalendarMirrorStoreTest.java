@@ -15,6 +15,7 @@ import nodomain.freeyourgadget.gadgetbridge.activities.devicesettings.DeviceSett
 import nodomain.freeyourgadget.gadgetbridge.util.calendar.CalendarEvent;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -386,5 +387,90 @@ public class SapCalendarMirrorStoreTest {
         final SapCalendarSnapshot snapshot = new SapCalendarSnapshot();
         assertEquals("trusted-debug-bootstrap", new SapCalendarMirrorStore(device.prefs).restore(snapshot, ZONE));
         return snapshot;
+    }
+
+    @Test
+    public void verifiedEmptyWatchRestoresEmptyMirrorThenNormalDiffAddsCurrentEvents() throws Exception {
+        final DevicePreferences device = new DevicePreferences();
+        saveRange(device);
+        assertTrue(new SapCalendarRangeStore(device.prefs).saveProgress(0, true));
+        final SapCalendarMirrorStore store = new SapCalendarMirrorStore(device.prefs);
+        assertTrue(store.invalidate("range-change")); // A genuine date request, no event transfer.
+        final String ranges = (String) device.durable.get(SapCalendarRangeStore.RANGES_KEY);
+        final String hash = String.join("", Collections.nCopies(64, "a"));
+        assertTrue(store.debugBootstrapEmpty(hash, ranges, ZONE));
+        final SapCalendarSnapshot snapshot = new SapCalendarSnapshot();
+        assertEquals("trusted-debug-empty-bootstrap",
+                new SapCalendarMirrorStore(device.prefs).restore(snapshot, ZONE));
+        assertTrue(snapshot.hasBaseline());
+        assertTrue(snapshot.getEvents().isEmpty());
+        assertEquals(0L, device.durable.get(SapCalendarRangeStore.SEQUENCE_KEY));
+        final SapCalendarSnapshot.Difference diff = snapshot.diff(Collections.singletonList(event("Synthetic", null)));
+        assertEquals(1, diff.addedCount);
+        assertEquals(0, diff.modifiedCount);
+        assertTrue(diff.deleted.isEmpty());
+        assertFalse(store.debugBootstrapEmpty(hash, ranges, ZONE)); // No trusted overwrite.
+    }
+
+    @Test
+    public void emptyRecoveryAcceptsOnlyObsoleteEmptyRangeChangeCheckpoint() throws Exception {
+        final DevicePreferences device = new DevicePreferences();
+        saveRange(device);
+        assertTrue(new SapCalendarRangeStore(device.prefs).saveProgress(0, true));
+        final SapCalendarMirrorStore store = new SapCalendarMirrorStore(device.prefs);
+        final String ranges = (String) device.durable.get(SapCalendarRangeStore.RANGES_KEY);
+        final String hash = String.join("", Collections.nCopies(64, "a"));
+        final SapCalendarSnapshot empty = new SapCalendarSnapshot();
+        empty.restoreTrusted(Collections.emptyList());
+        assertTrue(store.commit(empty, 0, ZONE));
+        assertEquals("mirror-not-unknown", store.debugEmptyBootstrapRefusal());
+        assertTrue(store.invalidate("range-change"));
+        assertNull(store.debugEmptyBootstrapRefusal());
+        assertTrue(store.debugBootstrapEmpty(hash, ranges, ZONE));
+        assertEquals("trusted-debug-empty-bootstrap", store.restore(new SapCalendarSnapshot(), ZONE));
+
+        assertTrue(store.invalidate("update-pending"));
+        assertEquals("interrupted-operation", store.debugEmptyBootstrapRefusal());
+        assertTrue(store.invalidate("range-change"));
+        final org.json.JSONObject checkpoint = new org.json.JSONObject(
+                (String) device.durable.get(SapCalendarMirrorStore.MIRROR_KEY));
+        device.durable.put(SapCalendarMirrorStore.MIRROR_KEY, checkpoint.put("sequence", 1).toString());
+        assertEquals("mirror-not-unknown", store.debugEmptyBootstrapRefusal());
+        device.durable.put(SapCalendarMirrorStore.MIRROR_KEY, "{corrupt");
+        assertEquals("mirror-state-invalid", store.debugEmptyBootstrapRefusal());
+    }
+
+    @Test
+    public void emptyRecoveryNeverOverwritesOldNonemptyCheckpoint() throws Exception {
+        final DevicePreferences device = new DevicePreferences();
+        saveRange(device);
+        assertTrue(new SapCalendarRangeStore(device.prefs).saveProgress(0, true));
+        final SapCalendarSnapshot snapshot = new SapCalendarSnapshot();
+        snapshot.restoreTrusted(Collections.singletonList(event("Synthetic", null)));
+        final SapCalendarMirrorStore store = new SapCalendarMirrorStore(device.prefs);
+        assertTrue(store.commit(snapshot, 0, ZONE));
+        assertTrue(store.invalidate("range-change"));
+        assertEquals("mirror-not-unknown", store.debugEmptyBootstrapRefusal());
+        assertFalse(store.debugBootstrapEmpty(String.join("", Collections.nCopies(64, "a")),
+                (String) device.durable.get(SapCalendarRangeStore.RANGES_KEY), ZONE));
+    }
+
+    @Test
+    public void emptyRecoveryRefusesUncertainUpdateIncompleteSyncAndChangedRanges() throws Exception {
+        final DevicePreferences device = new DevicePreferences();
+        saveRange(device);
+        assertTrue(new SapCalendarRangeStore(device.prefs).saveProgress(0, true));
+        final SapCalendarMirrorStore store = new SapCalendarMirrorStore(device.prefs);
+        final String ranges = (String) device.durable.get(SapCalendarRangeStore.RANGES_KEY);
+        final String hash = String.join("", Collections.nCopies(64, "a"));
+        assertFalse(store.debugBootstrapEmpty(hash, "[]", ZONE));
+        assertTrue(store.invalidate("update-pending"));
+        assertFalse(store.debugBootstrapEmpty(hash, ranges, ZONE));
+        assertTrue(store.invalidate("full-sync"));
+        assertFalse(store.debugBootstrapEmpty(hash, ranges, ZONE));
+        device.durable.remove(SapCalendarMirrorStore.STATE_KEY);
+        assertTrue(new SapCalendarRangeStore(device.prefs).saveProgress(1, true));
+        assertFalse(store.debugBootstrapEmpty(hash, ranges, ZONE));
+        assertSuppressed(device);
     }
 }

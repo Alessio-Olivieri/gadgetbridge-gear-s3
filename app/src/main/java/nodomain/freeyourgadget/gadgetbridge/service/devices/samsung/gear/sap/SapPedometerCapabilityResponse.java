@@ -11,7 +11,7 @@ import org.json.JSONObject;
 
 import java.nio.charset.StandardCharsets;
 
-/** Samsung Health capability JSON builders for the bounded API999 diagnostic. */
+/** Samsung Health capability JSON builders for API999 CommonSync negotiation. */
 public final class SapPedometerCapabilityResponse {
     public static final String SAMSUNG_HEALTH_PACKAGE = "com.sec.android.app.shealth";
     public static final String REQUEST = "com.samsung.shealth.REQUEST_CAPABILITY";
@@ -40,11 +40,11 @@ public final class SapPedometerCapabilityResponse {
     }
 
     /**
-     * Synthetic diagnostic only. The watch-side parser accepts either modern
+     * Minimal V4.51 response. The watch-side parser accepts either modern
      * discriminator, but the exact watch serializer emits both; retain both
      * here while deliberately omitting optional sync/capability claims.
      */
-    public static byte[] syntheticRichResponseJson(final Context context) {
+    public static byte[] richResponseJson(final Context context) {
         try {
             final JSONObject config = new JSONObject();
             config.put("os", "android");
@@ -58,7 +58,7 @@ public final class SapPedometerCapabilityResponse {
             response.put("config", config);
             return response.toString().getBytes(StandardCharsets.UTF_8);
         } catch (final JSONException e) {
-            throw new IllegalStateException("Unable to encode synthetic rich health capability response", e);
+            throw new IllegalStateException("Unable to encode rich health capability response", e);
         }
     }
 

@@ -98,6 +98,37 @@ public final class SapCalendarBootstrap {
 
     private SapCalendarBootstrap() { }
 
+    /** Manual debug recovery of an independently inspected EMPTY watch, not current Android data. */
+    public static Plan inspectEmpty(final SharedPreferences preferences, final TimeZone phoneZone) throws JSONException {
+        final SapCalendarRangeStore.State state = new SapCalendarRangeStore(preferences).load();
+        final String raw = preferences.getString(SapCalendarRangeStore.RANGES_KEY, "");
+        if (state.ranges.isEmpty() || new JSONArray(raw).length() != state.ranges.size()
+                || state.replaceOnNextRange || !state.sequenceSeen || state.sequence != 0
+                || preferences.getLong(SapCalendarRangeStore.SEQUENCE_KEY, -1) != 0
+                || !preferences.getBoolean(SapCalendarRangeStore.SEQUENCE_SEEN_KEY, false)
+                || preferences.getBoolean("gear_s3_calendar_replace_on_next_range_v1", true)) {
+            throw new Refusal("range-or-sequence-incomplete");
+        }
+        for (final String zone : state.zones) {
+            if (!phoneZone.getID().equals(zone)) throw new Refusal("range-options-mismatch");
+        }
+        return new Plan(java.util.Collections.emptyList(), "", raw, phoneZone.getID());
+    }
+
+    /** The explicit caller attests to the helper's stable, read-only DB inspection. */
+    public static void requireEmptyWatchProof(final String databaseSha256, final int count,
+                                              final long watchSequence, final long verifiedAt,
+                                              final long now) {
+        if (count != 0) throw new Refusal("watch-not-empty");
+        if (watchSequence != 0) throw new Refusal("watch-sequence-mismatch");
+        if (databaseSha256 == null || !databaseSha256.matches("[0-9a-f]{64}")) {
+            throw new Refusal("watch-proof-missing");
+        }
+        if (verifiedAt <= 0 || verifiedAt > now || now - verifiedAt > 300_000L) {
+            throw new Refusal("watch-proof-expired");
+        }
+    }
+
     public static Plan inspect(final SharedPreferences preferences, final TimeZone phoneZone,
                                final EventSource source, final int expectedRangeCount) throws JSONException {
         if (preferences == null || phoneZone == null || source == null) throw new IllegalArgumentException("Missing bootstrap input");

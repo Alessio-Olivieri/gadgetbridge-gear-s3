@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.preference.PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android">
+    <SwitchPreferenceCompat
+        android:defaultValue="false"
+        android:key="samsung_gear_contacts_allow_first_sync"
+        android:layout="@layout/preference_checkbox"
+        android:summary="@string/gear_s3_contacts_first_sync_summary"
+        android:title="@string/gear_s3_contacts_first_sync_title" />
+</androidx.preference.PreferenceScreen>

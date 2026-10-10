@@ -56,6 +56,7 @@ import nodomain.freeyourgadget.gadgetbridge.service.devices.samsung.gear.sap.Sap
 /** Bounded b2contacts provider and file-transfer sender. No contact content is logged. */
 public final class GearContactsService implements GearContactsDebugRequests.Target {
     public static final String CONTACTS = "/system/b2contacts";
+    public static final String ALLOW_FIRST_SYNC = "samsung_gear_contacts_allow_first_sync";
     public static final String FILE_TRANSFER = "/system/filetransfer";
     public static final String DEBUG_PENDING_DELETES_ACTION = "nodomain.freeyourgadget.gadgetbridge.DEBUG_GEAR_S3_CONTACTS_PENDING_DELETES";
     public static final String DEBUG_INSERT_RAW_ACTION = "nodomain.freeyourgadget.gadgetbridge.DEBUG_GEAR_S3_CONTACTS_INSERT_RAW";
@@ -90,6 +91,8 @@ public final class GearContactsService implements GearContactsDebugRequests.Targ
     private static final int MAX_FT_RECOVERY_RETRIES = 1;
     private final Context context;
     private final String deviceAddress;
+    private final SharedPreferences devicePreferences;
+    private long firstSyncAuthorizedGeneration = -1;
     private final GearSessionSecrets secrets;
     private final Emitter emitter;
     private final int contactsComponent, ftComponent, ftAgent, hostAgent;
@@ -175,6 +178,7 @@ public final class GearContactsService implements GearContactsDebugRequests.Targ
                         final GearContactsDebugRequests debugRequests) {
         this.context = context.getApplicationContext(); this.deviceAddress = deviceAddress; this.secrets = secrets; this.emitter = emitter;
         this.debugRequests = debugRequests;
+        this.devicePreferences = devicePreferences;
         snapshot = new GearContactsSnapshot(new GearContactsSnapshotStore(devicePreferences));
         LOG.info("Gear S3 contacts baseline restored: usable={} records={} deltaVerificationPending={} transportUncertainIds={} blockedIncompleteIds={}",
                 snapshot.isInitialized(), snapshot.size(), snapshot.hasPendingVerification(),
@@ -531,6 +535,14 @@ public final class GearContactsService implements GearContactsDebugRequests.Targ
             return true;
         }
         if (CONTACTS.equals(response.getProfile()) && pendingContacts >= 1) {
+            // A rejected setup can return the invalid-session sentinel instead of
+            // echoing the proposed session. It is not a successful session allocation.
+            if (response.getStatus() != SapServiceConnectionResponse.STATUS_SUCCESS
+                    && response.getAcceptorSlot() == remoteContacts && response.getInitiatorSlot() == contactsComponent
+                    && response.getSessionIds().equals(Collections.singletonList(0xffff))) {
+                controlStalled("connection rejected with invalid-session sentinel");
+                return true;
+            }
             if (!response.getSessionIds().contains(pendingContacts)) return false;
             if (response.getAcceptorSlot() != remoteContacts || response.getInitiatorSlot() != contactsComponent
                     || response.getSessionIds().size() != 1 || response.getSessionIds().get(0) != pendingContacts || response.getStatus() != 0) {
@@ -744,6 +756,21 @@ public final class GearContactsService implements GearContactsDebugRequests.Targ
         else onFtCommand(payload, session);
     }
 
+    /** Initial-required can clear watch contacts before the watch requests Initial. */
+    private boolean authorizeFirstSync() {
+        if (snapshot.isInitialized() || snapshot.size() > 0 || snapshot.hasInvalidLedger()
+                || snapshot.hasBlockedTransfers() || snapshot.persistentTestRawId() > 0
+                || snapshot.persistentDeleteTestRawId() > 0 || debugRequests.hasProductionTest()
+                || debugRequests.hasPending() || debugRequests.isActive()) return false;
+        if (firstSyncAuthorizedGeneration == controlGeneration) return true;
+        if (!devicePreferences.getBoolean(ALLOW_FIRST_SYNC, false)) return false;
+        // Consume before sending any potentially destructive control. A restart or
+        // another SAP generation must require a new explicit user decision.
+        if (!devicePreferences.edit().putBoolean(ALLOW_FIRST_SYNC, false).commit()) return false;
+        firstSyncAuthorizedGeneration = controlGeneration;
+        return true;
+    }
+
     private void onContactMessage(final byte[] payload) {
         if (disposed || controlState == ControlState.RETIRING) return;
         final String message = new String(payload, StandardCharsets.UTF_8);
@@ -758,6 +785,10 @@ public final class GearContactsService implements GearContactsDebugRequests.Targ
                     LOG.info("Gear S3 contacts log-activation control acknowledged: requested={}; call-log data sync is not implemented", logSyncRequested);
                 } else LOG.info("Gear S3 contacts unsupported control request");
             } else if (GearContactsCodec.control(message) == GearContactsCodec.Control.INITIAL_SYNC) {
+                if (initialPending || pendingInitial) {
+                    LOG.info("Gear S3 contacts repeated Initial held: initial scan/transfer already active; no queue reset or replay");
+                    return;
+                }
                 controlHandshakeReceived("Initial");
                 readyControlGeneration = -1; resumeScanPending = false;
                 if (pendingReplacement && !pendingDebugOneShot) {
@@ -775,9 +806,19 @@ public final class GearContactsService implements GearContactsDebugRequests.Targ
                     LOG.warn("Gear S3 contacts Initial held: incomplete per-ID transfers require recovery; no full import");
                     return;
                 }
+                if (snapshot.isInitialized() || snapshot.size() > 0) {
+                    controlReady = false;
+                    LOG.warn("Gear S3 contacts Initial held: retained transport baseline exists; watch inventory/recovery required; no full replay or baseline reset");
+                    return;
+                }
                 if (debugRequests.hasPending() || debugRequests.isActive() || debugRequests.hasProductionTest() || pendingReplacement) {
                     controlReady = false;
                     LOG.warn("Gear S3 contacts Initial held: debug request or replacement active; retained baseline unchanged");
+                    return;
+                }
+                if (!authorizeFirstSync()) {
+                    controlReady = false;
+                    LOG.warn("Gear S3 contacts Initial held: first-sync replacement not authorized; enable Replace watch contacts on first sync and reconnect; no files or baseline reset");
                     return;
                 }
                 controlReady = false;
@@ -807,6 +848,15 @@ public final class GearContactsService implements GearContactsDebugRequests.Targ
                 controlHandshakeReceived("Resume");
                 if (!hasPermission()) { LOG.warn("Gear S3 contacts permission missing; resume sync not started"); return; }
                 if (!snapshot.isInitialized()) {
+                    if (initialPending || pendingInitial) {
+                        LOG.info("Gear S3 contacts Resume held: initial transfer active; no repeated Initial-required response");
+                        return;
+                    }
+                    if (!authorizeFirstSync()) {
+                        controlReady = false;
+                        LOG.warn("Gear S3 contacts Resume held: local baseline unavailable; first sync can erase existing watch contacts; explicit replacement consent required; no Initial-required response");
+                        return;
+                    }
                     sendContact(GearContactsCodec.resumeResponse(false).getBytes(StandardCharsets.UTF_8));
                     LOG.info("Gear S3 contacts resume requires initial sync");
                 } else {

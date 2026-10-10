@@ -656,6 +656,8 @@ public class GearContactsDebugRequestsTest {
                 try { if (controller != null && field(controller, "deliveredTo") != null) debugScans++; }
                 catch (Exception e) { throw new AssertionError(e); }
                 for (long id : ids()) cursor.addRow(new Object[]{id, id + 1000, "Synthetic Person", 0});
+            } else if (uri.equals(ContactsContract.Contacts.CONTENT_URI)) {
+                for (long id : ids()) cursor.addRow(new Object[]{id + 1000, id});
             } else if (uri.equals(ContactsContract.Data.CONTENT_URI)) {
                 for (long id : ids()) cursor.addRow(new Object[]{id,
                         ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE, id >= 9119 ? number : "+15550001001", "2", null, null, 1});

@@ -87,6 +87,50 @@ public class GearContactsSourceTest {
         assertEquals("Person", contact.last);
     }
 
+    @Test public void linkedRawContactsShareActualAggregateNameSourceWithoutDroppingEitherRow() {
+        phone(NORMALIZED);
+        final long linkedId = RAW_ID + 1;
+        provider.raw(linkedId, false);
+        provider.data(linkedId * 10, linkedId, ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE,
+                "202 555 0102", "2", null, null);
+        provider.db.execSQL("UPDATE raw_contacts SET contact_id=? WHERE _id=?",
+                new Object[]{RAW_ID + 100000, linkedId});
+        final List<GearContactsCodec.Contact> contacts = GearContactsSource.read(context);
+        assertEquals(2, contacts.size());
+        assertEquals(RAW_ID, contacts.get(0).rawId);
+        assertEquals(linkedId, contacts.get(1).rawId);
+        assertEquals(contacts.get(0).contactId, contacts.get(1).contactId);
+        assertEquals(RAW_ID, contacts.get(0).displayRawId);
+        assertEquals(RAW_ID, contacts.get(1).displayRawId);
+        assertEquals(RAW_ID, GearContactsSource.readRaw(context, linkedId).displayRawId);
+    }
+
+    @Test public void aggregateNameSourceMayBeAnIneligibleRawContact() {
+        phone(NORMALIZED);
+        provider.raw(RAW_ID + 1, false); // No phone: still a valid aggregate name source.
+        provider.db.execSQL("UPDATE contacts SET name_raw_contact_id=? WHERE _id=?",
+                new Object[]{RAW_ID + 1, RAW_ID + 100000});
+        assertEquals(RAW_ID + 1, read().displayRawId);
+    }
+
+    @Test public void nameSourceChangeProducesReplacementInsteadOfNewRawContact() {
+        phone(NORMALIZED);
+        final GearContactsSnapshot snapshot = new GearContactsSnapshot();
+        assertTrue(snapshot.recordTransportDeliveredSnapshot(snapshot.compare(GearContactsSource.read(context), true)));
+        provider.db.execSQL("UPDATE contacts SET name_raw_contact_id=?", new Object[]{RAW_ID + 1});
+        final GearContactsSnapshot.Delta delta = snapshot.compare(GearContactsSource.read(context), false);
+        assertEquals(1, delta.update.size());
+        assertTrue(delta.insert.isEmpty());
+        assertTrue(delta.delete.isEmpty());
+    }
+
+    @Test(expected = IllegalStateException.class)
+    public void missingAggregateIdentityFailsInsteadOfInventingIdentityOrSelectingDeletes() {
+        phone(NORMALIZED);
+        provider.db.execSQL("DELETE FROM contacts");
+        GearContactsSource.read(context);
+    }
+
     @Test public void mixedNullAndPopulatedPhoneRowsAreBothIncluded() {
         phone(null);
         provider.data(RAW_ID * 10 + 2, RAW_ID, ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE,
@@ -213,6 +257,7 @@ public class GearContactsSourceTest {
         String rawSelection, dataSelection;
         @Override public boolean onCreate() {
             db = SQLiteDatabase.create(null);
+            db.execSQL("CREATE TABLE contacts (_id INTEGER PRIMARY KEY, name_raw_contact_id INTEGER)");
             db.execSQL("CREATE TABLE raw_contacts (_id INTEGER PRIMARY KEY, contact_id INTEGER, display_name TEXT, starred INTEGER, deleted INTEGER)");
             db.execSQL("CREATE TABLE data (_id INTEGER PRIMARY KEY, raw_contact_id INTEGER, mimetype TEXT, data1 TEXT, data2 TEXT, data3 TEXT, data4 TEXT, is_super_primary INTEGER)");
             return true;
@@ -222,6 +267,7 @@ public class GearContactsSourceTest {
             row.put("_id", id); row.put("contact_id", id + 100000); row.put("display_name", "Synthetic Person");
             row.put("starred", 0); row.put("deleted", deleted ? 1 : 0);
             db.insertOrThrow("raw_contacts", null, row);
+            db.execSQL("INSERT INTO contacts VALUES (?, ?)", new Object[]{id + 100000, id});
         }
         void data(long id, long rawId, String mime, String data1, String data2, String data3, String data4) {
             final ContentValues row = new ContentValues();
@@ -231,6 +277,8 @@ public class GearContactsSourceTest {
             db.insertOrThrow("data", null, row);
         }
         @Override public Cursor query(Uri uri, String[] projection, String selection, String[] args, String order) {
+            if (ContactsContract.Contacts.CONTENT_URI.equals(uri))
+                return db.query("contacts", projection, selection, args, null, null, order);
             final boolean raw = ContactsContract.RawContacts.CONTENT_URI.equals(uri);
             if (!raw && !ContactsContract.Data.CONTENT_URI.equals(uri)) throw new IllegalArgumentException("Unexpected test URI");
             if (raw) rawSelection = selection; else dataSelection = selection;

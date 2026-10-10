@@ -148,8 +148,6 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
     private static final UUID SAP_UUID = UUID.fromString("a49eb41e-cb06-495c-9f4f-bb80a90cdf00");
     private static final Map<String, WeakReference<GearS3DeviceSupport>> CALENDAR_DEBUG_SUPPORTS =
             new ConcurrentHashMap<>();
-    /** Debug-build-only configuration for notification image handling. */
-    private static final boolean SYNTHETIC_RICH_CAPABILITY_DIAGNOSTIC = BuildConfig.DEBUG;
     private final SapRecordCodec records = new SapRecordCodec();
     private final GearSessionSecrets secrets = new GearSessionSecrets();
     private WsmV2Client wsm;
@@ -208,6 +206,7 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
             java.util.concurrent.Executors.newSingleThreadExecutor(r -> new Thread(r, "GearS3SapApplications"));
     private volatile long sapDispatchGeneration;
     private volatile boolean sapDispatchDisposed;
+    private volatile boolean sapTransportClosed;
     private volatile CalendarRoute calendarRoute;
     private final SapCalendarReliableReceiver calendarReliableRxSession = new SapCalendarReliableReceiver();
     private final AtomicInteger calendarIngressPending = new AtomicInteger();
@@ -265,7 +264,7 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
     private GearContactsDebugRequests contactsDebugRequests;
     private boolean pedometerFirstPayloadLogged;
     private boolean pedometerManagerCapabilityResponded;
-    private boolean pedometerSyntheticRichCapabilityResponded;
+    private boolean pedometerRichCapabilityResponded;
     private boolean commonSyncActivityDataPersisted;
     private static final long HEALTH_FETCH_TIMEOUT_MILLIS = 90_000L;
     private static final long COMMON_SYNC_EXPECTING_TIMEOUT_MILLIS = 90_000L;
@@ -376,6 +375,7 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
             LOG.info("Gear S3 weather worker recreated for RFCOMM reconnect");
         }
         sapDispatchGeneration++;
+        sapTransportClosed = false;
         ensureNotificationPreparationExecutor();
         closeCalendarSession();
         restoreCalendarRanges();
@@ -458,12 +458,16 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
         LOG.info("Gear S3 FMP provider registered: agent={} component={} ASP=0200 role=04 channel=103",
                 fmpRegistration.getAgentUuid(), fmpRegistration.getComponentId());
         if (contactsService != null) contactsService.dispose();
+        final long contactsTransportGeneration = sapDispatchGeneration;
         contactsService = new GearContactsService(getContext(), GBApplication.getPrefs().getPreferences(),
                 GBApplication.getDeviceSpecificSharedPrefs(getDevice().getAddress()), getDevice().getAddress(), secrets,
                 hostManagerRegistration, usedContactsComponents, new GearContactsService.Emitter() {
-            @Override public void send(final SapPostAuthRecord record) { sendContactsRecord(record); }
+            @Override public void send(final SapPostAuthRecord record) { sendContactsRecord(record, contactsTransportGeneration); }
             @Override public Set<Integer> usedSessions() { return usedApplicationSessions(); }
-            @Override public boolean isConnected() { return GearS3DeviceSupport.this.isConnected(); }
+            @Override public boolean isConnected() {
+                return !sapTransportClosed && contactsTransportGeneration == sapDispatchGeneration
+                        && GearS3DeviceSupport.this.isConnected();
+            }
             @Override public void reconnect(final GearContactsService requester) {
                 recoverContactsConnection(requester);
             }
@@ -471,7 +475,7 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
         pedometerSecureEncoder = null;
         pedometerFirstPayloadLogged = false;
         pedometerManagerCapabilityResponded = false;
-        pedometerSyntheticRichCapabilityResponded = false;
+        pedometerRichCapabilityResponded = false;
         musicStateCache.reset();
         notificationIdentityStore = new SapNotificationIdentityStore(GBApplication.getPrefs().getPreferences());
         notificationReliableTxSequence = 1;
@@ -517,7 +521,7 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
                 dispatchPostAuthRecord(record, receivedAt, generation);
             }
         } catch (final RuntimeException e) {
-            enqueueSapApplication(() -> fail("invalid SAP input", e));
+            enqueueSapApplication(() -> fail("invalid SAP input", e), generation);
         }
     }
 
@@ -664,12 +668,15 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
     }
 
     private void enqueueSapApplication(final Runnable task) {
-        final long generation = sapDispatchGeneration;
-        if (sapDispatchDisposed) return;
+        enqueueSapApplication(task, sapDispatchGeneration);
+    }
+
+    private void enqueueSapApplication(final Runnable task, final long generation) {
+        if (sapDispatchDisposed || sapTransportClosed) return;
         try {
             sapApplicationExecutor.execute(() -> {
                 synchronized (GearS3DeviceSupport.this) {
-                    if (sapDispatchDisposed || generation != sapDispatchGeneration) return;
+                    if (sapDispatchDisposed || sapTransportClosed || generation != sapDispatchGeneration) return;
                     task.run();
                 }
             });
@@ -1047,6 +1054,14 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
                 weatherPreResponseRecords.clear();
                 LOG.warn("Gear S3 phone weather connection was not accepted; newest WeatherSpec retained", e);
             }
+            return;
+        }
+        if (message instanceof SapServiceConnectionResponse) {
+            // Expected responses were handled above. A late, repeated or unsolicited
+            // reply does not create a session and must not tear down the RFCOMM link.
+            final SapServiceConnectionResponse response = (SapServiceConnectionResponse) message;
+            LOG.warn("Gear S3 ignored unmatched SAP service connection response: profile={} status={} sessions={}",
+                    response.getProfile(), response.getStatus(), response.getSessionIds());
             return;
         }
         if (message instanceof SapServiceConnectionTerminationResponse
@@ -2123,6 +2138,10 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
     }
 
     private void requireCalendarDebugIdle() {
+        requireCalendarDebugIdle(false);
+    }
+
+    private void requireCalendarDebugIdle(final boolean emptyWatch) {
         final boolean ready = BuildConfig.DEBUG && calendarStateRestored && calendarMirrorStore != null
                 && calendarRangeStore != null && calendarServiceConnection != null;
         final SapCalendarServiceConnection.State connection = ready
@@ -2140,7 +2159,8 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
                         || calendarReliableRxSession.hasPendingBlockAck(),
                 calendarRefreshRunning.get(), calendarSequence == 0 && calendarInitialSequenceRequested)
                 .requireIdle();
-        final String storedRefusal = calendarMirrorStore.debugBootstrapRefusal();
+        final String storedRefusal = emptyWatch ? calendarMirrorStore.debugEmptyBootstrapRefusal()
+                : calendarMirrorStore.debugBootstrapRefusal();
         if (storedRefusal != null) throw new SapCalendarBootstrap.Refusal(storedRefusal);
         if (!GBApplication.getDeviceSpecificSharedPrefs(getDevice().getAddress())
                 .getBoolean(DeviceSettingsPreferenceConst.PREF_SYNC_CALENDAR, false)
@@ -2188,6 +2208,56 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
     /** Read-only diagnostic for the exported debug receiver. No transaction is created. */
     public SapCalendarBootstrap.Plan inspectCalendarDebug(final int expectedRangeCount) throws JSONException {
         synchronized (calendarLock) { return inspectCalendarDebugLocked(expectedRangeCount); }
+    }
+
+    /** Separate recovery for a freshly verified empty watch. No event read or SAP send. */
+    public SapCalendarBootstrap.Plan inspectEmptyCalendarDebug() throws JSONException {
+        synchronized (calendarLock) {
+            requireCalendarDebugIdle(true);
+            return SapCalendarBootstrap.inspectEmpty(
+                    GBApplication.getDeviceSpecificSharedPrefs(getDevice().getAddress()), TimeZone.getDefault());
+        }
+    }
+
+    public void bootstrapEmptyCalendarDebug(final String databaseSha256, final int watchCount,
+                                           final long watchSequence, final long verifiedAt,
+                                           final String inspectedRanges, final String inspectedZone) throws JSONException {
+        synchronized (calendarLock) {
+            final CalendarRoute route = calendarRoute;
+            final long generation = sapDispatchGeneration;
+            final int txBefore = calendarReliableTxSequence;
+            SapCalendarBootstrap.requireEmptyWatchProof(databaseSha256, watchCount, watchSequence,
+                    verifiedAt, System.currentTimeMillis());
+            final SapCalendarBootstrap.Plan plan = inspectEmptyCalendarDebug();
+            if (!plan.ranges.equals(inspectedRanges) || !plan.phoneZone.equals(inspectedZone)) {
+                throw new SapCalendarBootstrap.Refusal("range-options-mismatch");
+            }
+            requireCalendarDebugIdle(true);
+            if (calendarRoute != route || sapDispatchGeneration != generation) {
+                throw new SapCalendarBootstrap.Refusal("session-changed");
+            }
+            if (!calendarMirrorStore.debugBootstrapEmpty(databaseSha256, plan.ranges, plan.phoneZone)) {
+                throw new SapCalendarBootstrap.Refusal("checkpoint-refused");
+            }
+            final String restored = calendarMirrorStore.restore(calendarSnapshot, plan.phoneZone);
+            if (!"trusted-debug-empty-bootstrap".equals(restored)) {
+                calendarMirrorStore.invalidate("debug-empty-bootstrap-restore-failed");
+                calendarSnapshot.clear();
+                throw new SapCalendarBootstrap.Refusal("checkpoint-restore-failed");
+            }
+            try {
+                SapCalendarBootstrap.requireNoSapTx(txBefore, calendarReliableTxSequence);
+            } catch (final SapCalendarBootstrap.Refusal e) {
+                calendarMirrorStore.invalidate("debug-empty-bootstrap-sap-tx");
+                calendarSnapshot.clear();
+                throw e;
+            }
+            // Leave reconciliation pending but do not start it from the recovery action.
+            // The next observer notification or ordinary reconnect uses normal update/ACK handling.
+            calendarHandler.removeCallbacks(calendarRefreshRunnable);
+            calendarRefreshQueued = true;
+            LOG.info("Gear S3 calendar debug empty mirror bootstrap: trusted=true events=0 sequence=0 SAP_TX=0");
+        }
     }
 
     /** Explicit debug-only checkpoint; called after independent watch-DB fingerprint verification. */
@@ -2590,7 +2660,10 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
             calendarPendingDifference = difference;
             calendarUpdatePending = true;
             setCalendarRefreshPending(true);
-            sendCalendarPayload(json, "calendar-update-ind");
+            if (!sendCalendarPayload(json, "calendar-update-ind")) {
+                LOG.info("Gear S3 calendar update deferred: transport changed before queueing; retaining uncertain operation");
+                return;
+            }
             calendarHandler.postDelayed(calendarUpdateAckTimeoutRunnable, 30_000L);
             LOG.info("Gear S3 calendar update/delete indication TX: sequence={} added={} modified={} deleted={} replacementDeletes={} wireDeletedCount={} bytes={}",
                     calendarSequence, difference.addedCount, difference.modifiedCount, difference.removedCount(),
@@ -2603,9 +2676,9 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
         }
     }
 
-    private void sendCalendarPayload(final String json, final String label) {
+    private boolean sendCalendarPayload(final String json, final String label) {
         final CalendarRoute route = calendarRoute;
-        if (route == null) return;
+        if (route == null) return false;
         if (LOG.isDebugEnabled() && (label.startsWith("calendar-listwithoption-rsp")
                 || label.startsWith("calendar-update-ind"))) {
             try {
@@ -2626,10 +2699,27 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
         final byte[] frame = SapCalendarCodec.encodeFrame(sequence, json);
         final SapPostAuthRecord record = new SapPostAuthRecord(new SapTransportHeader(0, 0,
                 route.session, 0), frame);
-        createTransactionBuilder("gearS3CalendarPayload")
+        final TransactionBuilder transaction = createTransactionBuilder("gearS3CalendarPayload")
                 .run(socket -> calendarRoute == route && sapDispatchGeneration == route.generation)
-                .write(SapPostAuthRecordCodec.encode(record)).queue();
+                .write(SapPostAuthRecordCodec.encode(record));
+        if (!queueCalendarTransaction(transaction, route)) return false;
         LOG.info("Gear S3 calendar TX: msgId={} reliableSeq={} bytes={}", label, sequence, frame.length);
+        return true;
+    }
+
+    /** Calendar runs independently of the support monitor, but queue lifetime uses ConnectionMonitor. */
+    private boolean queueCalendarTransaction(final TransactionBuilder transaction, final CalendarRoute route) {
+        synchronized (ConnectionMonitor) {
+            if (sapDispatchDisposed || sapTransportClosed || calendarRoute != route || sapDispatchGeneration != route.generation
+                    || !isConnected()) {
+                LOG.info("Gear S3 calendar TX deferred: stale or disconnected transport; task={}",
+                        transaction.getTaskName());
+                return false;
+            }
+            // disconnect/dispose cannot remove the queue between this check and queue().
+            transaction.queue();
+            return true;
+        }
     }
 
     private void scheduleCalendarReliableAck() {
@@ -2652,11 +2742,12 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
         LOG.info("Gear S3 calendar reliable ACK TX queued: session={} sequence={} queuedAtMs={} timerAgeMs={}",
                 calendarRoute.session, sequence, queuedAt, queuedAt - calendarAckScheduledAt);
         final int session = route.session;
-        createTransactionBuilder("gearS3CalendarReliableAck")
+        final TransactionBuilder transaction = createTransactionBuilder("gearS3CalendarReliableAck")
                 .run(socket -> calendarRoute == route && sapDispatchGeneration == route.generation)
                 .write(SapPostAuthRecordCodec.encode(record))
                 .run(() -> LOG.info("Gear S3 calendar reliable ACK TX written: session={} sequence={} queueDelayMs={}",
-                        session, sequence, android.os.SystemClock.elapsedRealtime() - queuedAt)).queue();
+                        session, sequence, android.os.SystemClock.elapsedRealtime() - queuedAt));
+        queueCalendarTransaction(transaction, route);
     }
 
     private void sendCalendarReliableNak(final int expected) {
@@ -2665,9 +2756,10 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
         final SapPostAuthRecord record = new SapPostAuthRecord(new SapTransportHeader(0, 1,
                 route.session, 0), SapNotificationServiceCodec.encodeReliableNak(expected, expected));
         LOG.info("Gear S3 calendar reliable NAK TX: missing={} queued={}", expected, calendarReliableRxSession.getQueuedCount());
-        createTransactionBuilder("gearS3CalendarReliableNak")
+        final TransactionBuilder transaction = createTransactionBuilder("gearS3CalendarReliableNak")
                 .run(socket -> calendarRoute == route && sapDispatchGeneration == route.generation)
-                .write(SapPostAuthRecordCodec.encode(record)).queue();
+                .write(SapPostAuthRecordCodec.encode(record));
+        queueCalendarTransaction(transaction, route);
     }
 
     private void closeCalendarSession() {
@@ -2755,7 +2847,19 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
     }
 
     private void sendContactsRecord(final SapPostAuthRecord record) {
-        createTransactionBuilder("gearS3Contacts").write(SapPostAuthRecordCodec.encode(record)).queue();
+        sendContactsRecord(record, sapDispatchGeneration);
+    }
+
+    private void sendContactsRecord(final SapPostAuthRecord record, final long generation) {
+        synchronized (ConnectionMonitor) {
+            if (sapDispatchDisposed || sapTransportClosed || generation != sapDispatchGeneration || !isConnected()) {
+                LOG.debug("Gear S3 contacts TX dropped: stale or disconnected transport");
+                return;
+            }
+            createTransactionBuilder("gearS3Contacts")
+                    .run(socket -> !sapDispatchDisposed && !sapTransportClosed && generation == sapDispatchGeneration)
+                    .write(SapPostAuthRecordCodec.encode(record)).queue();
+        }
     }
 
     /** Start only after CapEx has exposed our consumer and learned the Gear provider. */
@@ -2928,18 +3032,10 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
             LOG.warn("Gear S3 ignored malformed watch pedometer JSON: {}", result.getError());
             return;
         }
-        final boolean richCapabilityTypeMatch = SapPedometerCapabilityResponse.REQUEST.equals(stringField(result, "capability_type"));
-        final boolean richMessageTypeMatch = SapPedometerCapabilityResponse.RICH_REQUEST.equals(stringField(result, "message_type"));
-        final boolean richSenderMatch = "wearable".equals(stringField(result, "sender"));
-        final boolean richReceiverMatch = "shealth".equals(stringField(result, "receiver"));
         if (isManagerCapabilityRequest(result)) sendManagerCapabilityResponse();
-        if (richCapabilityTypeMatch && richMessageTypeMatch && richSenderMatch && richReceiverMatch) {
+        if (SapPedometerCapabilityResponse.isRichCapabilityRequest(result)) {
             LOG.debug("Gear S3 watch pedometer rich capability request detected");
-            if (SYNTHETIC_RICH_CAPABILITY_DIAGNOSTIC) {
-                sendSyntheticRichCapabilityResponse();
-            } else {
-                LOG.warn("Gear S3 synthetic rich capability diagnostic disabled outside debug builds");
-            }
+            sendRichCapabilityResponse();
         }
         final SapPedometerJsonProbe.CommonSync commonSync = SapPedometerJsonProbe.inspectCommonSync(result);
         if (commonSync != null) {
@@ -3124,30 +3220,27 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
         }
     }
 
-    /**
-     * Diagnostic-only false capability emulation. This deliberately stops at
-     * the capability response; subsequent common-sync messages remain receive-only.
-     */
-    private void sendSyntheticRichCapabilityResponse() {
-        if (pedometerSyntheticRichCapabilityResponded) {
-            LOG.info("Gear S3 watch pedometer synthetic rich capability response already queued; ignoring duplicate");
+    /** Reply once per health session so the watch can initiate CommonSync in every build type. */
+    private void sendRichCapabilityResponse() {
+        if (pedometerRichCapabilityResponded) {
+            LOG.debug("Gear S3 watch pedometer rich capability response already queued; ignoring duplicate");
             return;
         }
         if (pedometerSecureEncoder == null || pedometerServiceConnector == null
                 || pedometerServiceConnector.getState() != SapPedometerServiceConnector.State.ESTABLISHED) {
-            LOG.warn("Gear S3 cannot send synthetic rich capability response without an established health TX cipher");
+            LOG.warn("Gear S3 cannot send rich capability response without an established health TX cipher");
             return;
         }
-        final byte[] clear = SapPedometerCapabilityResponse.syntheticRichResponseJson(getContext());
+        final byte[] clear = SapPedometerCapabilityResponse.richResponseJson(getContext());
         try {
             final SapPedometerSecureEncoder.EncodedFrame frame = pedometerSecureEncoder.encode(clear);
             final SapPostAuthRecord record = new SapPostAuthRecord(new SapTransportHeader(0, 0,
                     pedometerServiceConnector.getApplicationSessionId(), 0), frame.getBody());
             final byte[] encoded = SapPostAuthRecordCodec.encode(record);
-            LOG.debug("Gear S3 watch pedometer synthetic rich capability response queued: txSequence={} sdk=0x{} compressed={} compressionChoice={} clearBytes={} protectedBytes={}",
+            LOG.debug("Gear S3 watch pedometer rich capability response queued: txSequence={} sdk=0x{} compressed={} compressionChoice={} clearBytes={} protectedBytes={}",
                     frame.getSequence(), Integer.toHexString(frame.getSdk()), frame.isCompressed(),
                     frame.isCompressed() ? "zlib" : "none", frame.getClearLength(), frame.getProtectedLength());
-            createTransactionBuilder("gearS3WatchPedometerSyntheticRichCapabilityResponse")
+            createTransactionBuilder("gearS3WatchPedometerRichCapabilityResponse")
                     .write(encoded)
                     .run(() -> {
                         synchronized (GearS3DeviceSupport.this) {
@@ -3157,13 +3250,13 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
                                         COMMON_SYNC_EXPECTING_TIMEOUT_MILLIS);
                                 LOG.info("Gear S3 CommonSync state: IDLE -> EXPECTING_SYNC");
                             }
-                            LOG.info("Gear S3 watch pedometer synthetic diagnostic response sent");
+                            LOG.info("Gear S3 watch pedometer rich capability response sent");
                         }
                     })
                     .queue();
-            pedometerSyntheticRichCapabilityResponded = true;
+            pedometerRichCapabilityResponded = true;
         } catch (final RuntimeException e) {
-            LOG.warn("Gear S3 watch pedometer synthetic rich capability response send=failure", e);
+            LOG.warn("Gear S3 watch pedometer rich capability response send=failure", e);
         }
     }
 
@@ -3931,7 +4024,7 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
     private void resetPedometerConnectionDiagnostics() {
         pedometerFirstPayloadLogged = false;
         pedometerManagerCapabilityResponded = false;
-        pedometerSyntheticRichCapabilityResponded = false;
+        pedometerRichCapabilityResponded = false;
     }
 
     private boolean completeHealthFetch() {
@@ -3985,7 +4078,11 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
     }
 
     @Override
-    public void disconnect() {
+    public synchronized void disconnect() {
+        // Retire queued SAP work before the queue is removed. initializeDevice starts a new generation.
+        sapTransportClosed = true;
+        sapDispatchGeneration++;
+        closeCalendarSession();
         disposeFindMyPhone();
         healthDiagnostics.close();
         // Underlying device loss differs from control-profile churn: cancel recovery callbacks
@@ -4018,8 +4115,12 @@ public class GearS3DeviceSupport extends AbstractBTBRDeviceSupport {
         notificationImageExecutor.shutdownNow();
         bcmFeatureExchange = null;
         hostManagerApplication = null;
-        createTransactionBuilder("gearS3Failure").setDeviceState(GBDevice.State.WAITING_FOR_RECONNECT).queue();
         disconnect();
+        // Failure reporting must work even when a previous disconnect already removed the queue.
+        // Publish after disconnect's NOT_CONNECTED update so reconnect is not overwritten.
+        if (!sapDispatchDisposed && getDevice() != null) {
+            getDevice().setUpdateState(GBDevice.State.WAITING_FOR_RECONNECT, getContext());
+        }
     }
 
     @Override

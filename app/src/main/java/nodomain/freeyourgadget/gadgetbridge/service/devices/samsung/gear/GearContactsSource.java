@@ -49,6 +49,18 @@ public final class GearContactsSource {
                 rows.put(row.id, row);
             }
         }
+        // Android aggregates several RawContacts into one Contacts row. The name-source
+        // raw ID belongs to that aggregate; using each raw ID splits linked watch people.
+        final Map<Long, Long> nameSources = new LinkedHashMap<>();
+        try (Cursor cursor = context.getContentResolver().query(ContactsContract.Contacts.CONTENT_URI,
+                new String[]{ContactsContract.Contacts._ID, ContactsContract.Contacts.NAME_RAW_CONTACT_ID},
+                null, null, ContactsContract.Contacts._ID + " ASC")) {
+            if (cursor == null) throw new IllegalStateException("Gear aggregate contacts provider unavailable");
+            while (cursor.moveToNext()) {
+                if (!cursor.isNull(1) && cursor.getLong(1) > 0)
+                    nameSources.put(cursor.getLong(0), cursor.getLong(1));
+            }
+        }
         final String[] dataColumns = {ContactsContract.Data.RAW_CONTACT_ID, ContactsContract.Data.MIMETYPE,
                 ContactsContract.Data.DATA1, ContactsContract.Data.DATA2, ContactsContract.Data.DATA3,
                 ContactsContract.Data.DATA4, ContactsContract.Data.IS_SUPER_PRIMARY};
@@ -83,7 +95,10 @@ public final class GearContactsSource {
                 LOG.debug("Gear S3 contacts source omitted: rawId={}; no nonempty phone DATA1 returned", row.id);
                 continue;
             }
-            result.add(new GearContactsCodec.Contact(row.id, row.contactId, row.id,
+            final Long nameSource = nameSources.get(row.contactId);
+            // An inconsistent provider scan must not fabricate an identity or look like a deletion.
+            if (nameSource == null) throw new IllegalStateException("Gear aggregate name source unavailable");
+            result.add(new GearContactsCodec.Contact(row.id, row.contactId, nameSource,
                     row.display == null ? "" : row.display, row.first, row.last, row.favorite, row.numbers));
             if (LOG.isDebugEnabled() && row.numbers.stream().anyMatch(number -> number.normalized == null))
                 LOG.debug("Gear S3 contacts source included: rawId={}; phoneRows={}; contains null DATA4", row.id, row.numbers.size());
